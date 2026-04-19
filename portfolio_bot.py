@@ -8,27 +8,28 @@ import json
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-CHECK_INTERVAL = 3600
-
-COOLDOWN_FILE = "cooldown.json"
+CHECK_INTERVAL = 3600  # 1 hour
 
 # ================================
-# PORTFOLIO (BUY PRICES ONLY)
+# YOUR PORTFOLIO
 # ================================
 portfolio = {
     "core": {
-        "NVDA": {"buy": 180},
-        "AVGO": {"buy": 315},
-        "MSFT": {"buy": 390},
-        "ANET": {"buy": 136},
-        "MRVL": {"buy": 87},
+        "EQQQ": 0.25,
+        "NVDA": 0.15,
+        "AVGO": 0.12,
+        "MSFT": 0.12,
+        "VRT": 0.10,
+        "TSM": 0.10,
+        "ANET": 0.08,
+        "MRVL": 0.08
     },
     "aggressive": {
-        "APP": {"buy": 440},
-        "AMD": {"buy": 200},
-        "MSTR": {"buy": 140},
-        "ASTS": {"buy": 90},
-        "SOUN": {"buy": 7},
+        "APP": 0.30,
+        "AMD": 0.25,
+        "MSTR": 0.20,
+        "ASTS": 0.15,
+        "SOUN": 0.10
     }
 }
 
@@ -40,150 +41,81 @@ def send(msg):
     requests.post(url, json={"chat_id": CHAT_ID, "text": msg})
 
 # ================================
-# DATA
+# GET DATA
 # ================================
-def get_price(ticker):
+def get_data(ticker):
     try:
         stock = yf.Ticker(ticker)
-        data = stock.history(period="1d")
-        if data.empty:
+        hist = stock.history(period="1mo")
+
+        if hist.empty:
             return None
-        return data["Close"].iloc[-1]
+
+        current = hist["Close"].iloc[-1]
+        old = hist["Close"].iloc[0]
+
+        change = (current - old) / old
+        return current, change
+
     except:
         return None
 
-def get_signal():
-    try:
-        with open("signals.json", "r") as f:
-            return json.load(f)
-    except:
-        return None
-
 # ================================
-# COOLDOWN
+# CLASSIFICATION LOGIC (SMART MODE)
 # ================================
-def load_cooldown():
-    try:
-        with open(COOLDOWN_FILE, "r") as f:
-            return json.load(f)
-    except:
-        return {}
-
-def save_cooldown(data):
-    with open(COOLDOWN_FILE, "w") as f:
-        json.dump(data, f)
-
-cooldowns = load_cooldown()
-
-# ================================
-# HELPERS
-# ================================
-def decision(pct):
-    if pct >= 25:
-        return "🔥 TRIM (overextended)"
-    elif pct >= 15:
-        return "⚡ STRONG"
-    elif pct <= -20:
-        return "❌ CUT"
-    elif pct <= -10:
-        return "⚠️ WEAK"
+def classify(change):
+    if change >= 0.30:
+        return "🔥 TRIM", "Overextended (lock profits)"
+    elif change >= 0.15:
+        return "⚡ STRONG", "Momentum strong (wait pullback)"
+    elif change >= -0.05:
+        return "✅ HOLD", "Healthy range"
     else:
-        return "✅ HOLD"
-
-def impact_score(from_pct, to_pct):
-    return round(to_pct - from_pct, 2)
+        return "🧊 WAIT", "Weak (no adds)"
 
 # ================================
 # ANALYSIS
 # ================================
 def analyse():
-    report = "📊 Portfolio Intelligence (Final System)\n\n"
-
-    signal = get_signal()
-
-    valid_signal = False
-    if signal:
-        if signal.get("confidence") in ["HIGH", "VERY HIGH"] and signal.get("score", 0) >= 5:
-            valid_signal = True
+    report = "📊 Portfolio Intelligence (Smart Mode)\n\n"
+    actions = []
 
     for pot_name, assets in portfolio.items():
         report += f"--- {pot_name.upper()} ---\n"
 
-        performance = []
+        for ticker, weight in assets.items():
+            data = get_data(ticker)
 
-        for ticker, data in assets.items():
-            price = get_price(ticker)
-
-            if not price:
+            if not data:
+                report += f"{ticker}: no data\n"
                 continue
 
-            buy = data["buy"]
-            pct = ((price - buy) / buy) * 100
+            price, change = data
+            status, note = classify(change)
 
-            performance.append((ticker, pct))
+            report += f"{ticker}: {round(change*100,2)}% {status} ({note})\n"
 
-            report += f"{ticker}: {round(pct,2)}% {decision(pct)}\n"
-
-        performance.sort(key=lambda x: x[1], reverse=True)
-        top = performance[:2]
-
-        report += "\n🔁 Actions:\n"
-
-        for ticker, pct in performance:
-            now = time.time()
-            last = cooldowns.get(ticker, 0)
-
-            if now - last < 86400:
-                continue
-
-            # CORE RULES
-            if pot_name == "core":
-                if pct >= 25:
-                    report += f"→ Trim {ticker} by 10%\n"
-                    cooldowns[ticker] = now
-
-                elif pct <= -20:
-                    report += f"→ Reduce {ticker}\n"
-                    cooldowns[ticker] = now
-
-            # AGGRESSIVE RULES
-            elif pot_name == "aggressive":
-                if pct <= -15 and top:
-                    target = None
-
-                    if valid_signal:
-                        target = signal["asset"].replace("/USDT", "")
-                    else:
-                        target = top[0][0]
-
-                    impact = impact_score(pct, top[0][1])
-
-                    if impact >= 5:
-                        report += f"→ Move 20% from {ticker} → {target} (Impact +{impact}%)\n"
-                        cooldowns[ticker] = now
-
-                elif -5 < pct < 5 and top:
-                    target = top[0][0]
-                    impact = impact_score(pct, top[0][1])
-
-                    if impact >= 5:
-                        report += f"→ Rotate 10% from {ticker} → {target} (Impact +{impact}%)\n"
-                        cooldowns[ticker] = now
-
-                elif pct >= 25:
-                    report += f"→ Trim {ticker} by 20%\n"
-                    cooldowns[ticker] = now
+            # ACTION LOGIC
+            if "TRIM" in status:
+                actions.append(f"Trim {ticker} by 10% → move to CASH")
+            elif "WAIT" in status:
+                actions.append(f"Do NOT add to {ticker} yet")
 
         report += "\n"
 
-    save_cooldown(cooldowns)
+    # Remove duplicates
+    actions = list(dict.fromkeys(actions))
+
+    if actions:
+        report += "💡 Actions:\n"
+        for a in actions:
+            report += f"→ {a}\n"
 
     report += f"\n🕒 {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
-
     return report
 
 # ================================
-# LOOP
+# MAIN LOOP
 # ================================
 def run():
     while True:
@@ -192,6 +124,7 @@ def run():
             print("Sending update...")
             send(msg)
             print("Done.\n")
+
         except Exception as e:
             print("Error:", e)
 
@@ -201,5 +134,5 @@ def run():
 # START
 # ================================
 if __name__ == "__main__":
-    print("Final portfolio system running...")
+    print("Portfolio bot running (SMART MODE)...")
     run()
