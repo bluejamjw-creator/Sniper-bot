@@ -43,7 +43,7 @@ portfolio = {
 }
 
 # ================================
-# SECTOR MAP (for correlation)
+# SECTOR MAP
 # ================================
 SECTORS = {
     "NVDA": "AI", "AMD": "AI", "AVGO": "AI", "MRVL": "AI",
@@ -87,14 +87,14 @@ def get_data(ticker):
         return None
 
 # ================================
-# SIGNAL
+# SIGNALS (FIXED)
 # ================================
-def get_signal():
+def get_signals():
     try:
         with open("signals.json", "r") as f:
             return json.load(f)
     except:
-        return None
+        return []
 
 # ================================
 # TRADE COOLDOWN
@@ -117,7 +117,7 @@ def classify(change):
     if change >= 0.30:
         return "🔥 TRIM", "Overextended"
     elif change >= 0.15:
-        return "⚡ STRONG", "Wait pullback"
+        return "⚡ STRONG", "Momentum"
     elif change >= -0.05:
         return "✅ HOLD", "Healthy"
     else:
@@ -148,7 +148,7 @@ def too_correlated(asset):
 
     return count >= 4
 
-def allow_new_trade(performance, signal):
+def allow_new_trade(performance, asset):
     weak = len([p for _, p in performance if p < -5])
     strong = len([p for _, p in performance if p > 25])
 
@@ -161,13 +161,28 @@ def allow_new_trade(performance, signal):
     if current_risk_estimate(performance) >= MAX_TOTAL_RISK:
         return False, "Max risk reached"
 
-    if too_correlated(signal["asset"]):
+    if too_correlated(asset):
         return False, "Too correlated"
 
     if time.time() - last_trade_time() < 86400:
         return False, "Cooldown active"
 
     return True, "OK"
+
+# ================================
+# ROTATION ENGINE (NEW)
+# ================================
+def rotation_engine(performance):
+    weak = sorted([p for p in performance if p[1] < -0.05], key=lambda x: x[1])
+    strong = sorted([p for p in performance if p[1] > 0.15], key=lambda x: x[1], reverse=True)
+
+    actions = []
+
+    for w, s in zip(weak, strong):
+        impact = round((s[1] - w[1]) * 100, 2)
+        actions.append(f"Rotate 10% from {w[0]} → {s[0]} (+{impact}%)")
+
+    return actions
 
 # ================================
 # ANALYSIS
@@ -209,32 +224,35 @@ def analyse():
     )
 
     if candidates:
-        report += "🎯 Watchlist (wait pullback)\n"
+        report += "🎯 Watchlist\n"
         for t, c in candidates[:3]:
             report += f"→ {t} ({round(c*100,2)}%)\n"
 
     # =====================
-    # SNIPER FILTER
+    # ROTATION
     # =====================
-    signal = get_signal()
+    rotations = rotation_engine(performance)
+    if rotations:
+        report += "\n🔄 Smart Rotation\n"
+        for r in rotations:
+            report += f"→ {r}\n"
 
-    if signal:
-        allowed, reason = allow_new_trade(performance, signal)
+    # =====================
+    # SNIPER
+    # =====================
+    signals = get_signals()
 
-        report += "\n🤖 Sniper Decision\n"
+    if signals:
+        report += "\n🤖 Sniper Opportunities\n"
 
-        if allowed:
-            entry = signal.get("entry", 0)
-            stop = signal.get("sl", entry * 0.97)
-            size = position_size(entry, stop)
+        for asset in signals[-3:]:
+            allowed, reason = allow_new_trade(performance, asset)
 
-            report += f"✅ Trade: {signal['asset']}\n"
-            report += f"Entry: {entry}\nStop: {round(stop,2)}\nSize: {size}\n"
-
-            save_trade_time()
-
-        else:
-            report += f"❌ Skip: {signal['asset']}\nReason: {reason}\n"
+            if allowed:
+                report += f"✅ {asset} allowed\n"
+                save_trade_time()
+            else:
+                report += f"❌ {asset} blocked ({reason})\n"
 
     # =====================
     # ACTIONS
@@ -255,11 +273,11 @@ def run():
         try:
             msg = analyse()
 
-            if "💡 Actions" in msg or "✅ Trade" in msg:
+            if "💡 Actions" in msg or "Sniper" in msg:
                 print("Sending update...")
                 send(msg)
             else:
-                print("No important changes")
+                print("No major change")
 
         except Exception as e:
             print("Error:", e)
@@ -272,3 +290,4 @@ def run():
 if __name__ == "__main__":
     print("Portfolio system running...")
     run()
+
