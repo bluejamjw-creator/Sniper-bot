@@ -1,7 +1,7 @@
 const { spawn } = require('child_process');
 
 // Start Python portfolio bot
-const pythonProcess = spawn('python', ['portfolio_bot.py']);
+const pythonProcess = spawn('python3', ['portfolio_bot.py']);
 
 pythonProcess.stdout.on('data', (data) => {
   console.log(`PYTHON: ${data}`);
