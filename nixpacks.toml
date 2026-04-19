@@ -2,7 +2,10 @@
 nixPkgs = ["nodejs_20", "python311"]
 
 [phases.install]
-cmds = ["npm install", "pip install -r requirements.txt"]
+cmds = [
+  "npm install",
+  "pip install -r requirements.txt"
+]
 
 [start]
-cmd = "node sniper-final.js & python3 portfolio_bot.py"
+cmd = "bash start.sh"
