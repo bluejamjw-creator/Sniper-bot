@@ -1,0 +1,5 @@
+[phases.setup]
+nixPkgs = ["nodejs_20", "python311"]
+
+[start]
+cmd = "node sniper-final.js"
