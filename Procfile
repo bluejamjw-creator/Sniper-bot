@@ -1,1 +1,1 @@
-worker: node sniper-final.js
+worker: npm start
