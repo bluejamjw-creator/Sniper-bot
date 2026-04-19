@@ -3,8 +3,10 @@ import requests
 import yfinance as yf
 from datetime import datetime
 
-BOT_TOKEN = "YOUR_BOT_TOKEN"
-CHAT_ID = "YOUR_CHAT_ID"
+import os
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
 CHECK_INTERVAL = 3600  # 1 hour
 PROFIT_TAKE = 0.25     # 25%
