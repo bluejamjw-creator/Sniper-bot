@@ -1,0 +1,11 @@
+{
+  "name": "sniper-bot",
+  "version": "1.0.0",
+  "main": "sniper-final.js",
+  "scripts": {
+    "start": "node sniper-final.js"
+  },
+  "engines": {
+    "node": "20.x"
+  }
+}
