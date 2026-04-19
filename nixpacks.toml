@@ -8,4 +8,4 @@ cmds = [
 ]
 
 [start]
-cmd = "node sniper-final.js"
+cmd = "npm start"
