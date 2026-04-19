@@ -1,3 +1,15 @@
+const { spawn } = require('child_process');
+
+// Start Python portfolio bot
+const pythonProcess = spawn('python', ['portfolio_bot.py']);
+
+pythonProcess.stdout.on('data', (data) => {
+  console.log(`PYTHON: ${data}`);
+});
+
+pythonProcess.stderr.on('data', (data) => {
+  console.error(`PYTHON ERROR: ${data}`);
+});
 // ============================================================
 //   SNIPER BREAKOUT ALERTS  FINAL EDITION
 // ============================================================
