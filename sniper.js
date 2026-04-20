@@ -484,9 +484,19 @@ async function manageTrades(){
 // =======================
 // RUN
 // =======================
-async function run(){
-  await scan();
-  await manageTrades();
+async function runCycle() {
+  console.log("=== NEW CYCLE ===", new Date().toISOString());
+
+  try {
+    await scan();
+    await manageTrades();
+  } catch (e) {
+    console.error("Cycle error:", e.message);
+  }
 }
 
-run().catch(console.error);
+// run immediately
+runCycle();
+
+// run every 5 minutes
+setInterval(runCycle, 300000);
