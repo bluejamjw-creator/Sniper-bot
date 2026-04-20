@@ -1,0 +1,24 @@
+{
+  "core": {
+    "SMH": 29,
+    "EQQQ.L": 25,
+    "INDA": 20,
+    "PLTR": 13,
+    "VRT": 8,
+    "COIN": 5
+  },
+  "aggressive": {
+    "APP": 28,
+    "AMD": 22,
+    "MSTR": 20,
+    "ASTS": 15,
+    "SOUN": 10,
+    "COIN": 5
+  },
+  "crypto": {
+    "RNDR": 33,
+    "FET": 27,
+    "SOL": 20,
+    "ETH": 20
+  }
+}
