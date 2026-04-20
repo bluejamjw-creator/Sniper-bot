@@ -11,11 +11,13 @@ PORTFOLIO_PID=$!
 
 trap 'echo "Shutting down..."; kill "$SNIPER_PID" "$PORTFOLIO_PID" 2>/dev/null || true' INT TERM
 
-wait -n "$SNIPER_PID" "$PORTFOLIO_PID"
-STATUS=$?
+while kill -0 "$SNIPER_PID" 2>/dev/null && kill -0 "$PORTFOLIO_PID" 2>/dev/null; do
+  sleep 5
+done
 
-echo "One process exited with status $STATUS. Stopping both..."
+echo "One process exited. Stopping both..."
 kill "$SNIPER_PID" "$PORTFOLIO_PID" 2>/dev/null || true
-wait 2>/dev/null || true
+wait "$SNIPER_PID" 2>/dev/null || true
+wait "$PORTFOLIO_PID" 2>/dev/null || true
 
-exit "$STATUS"
+exit 1
