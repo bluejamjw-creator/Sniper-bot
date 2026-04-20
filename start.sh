@@ -3,12 +3,18 @@ set -eu
 
 echo "Starting Sniper + Portfolio..."
 
+python3 portfolio_bot.py &
+PORTFOLIO_PID=$!
+
 node sniper.js &
 SNIPER_PID=$!
 
-python portfolio_bot.py &
-PORTFOLIO_PID=$!
+cleanup() {
+  kill $PORTFOLIO_PID $SNIPER_PID 2>/dev/null || true
+  wait $PORTFOLIO_PID $SNIPER_PID 2>/dev/null || true
+}
 
-trap 'echo "Stopping..."; kill $SNIPER_PID $PORTFOLIO_PID 2>/dev/null || true' INT TERM
+trap cleanup INT TERM
 
-wait $SNIPER_PID $PORTFOLIO_PID
+wait -n $PORTFOLIO_PID $SNIPER_PID
+cleanup
