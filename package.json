@@ -1,0 +1,14 @@
+{
+  "name": "sniper-bot",
+  "version": "1.0.0",
+  "main": "sniper-final.js",
+  "scripts": {
+    "start": "sh ./start.sh"
+  },
+  "engines": {
+    "node": "20.x"
+  },
+  "dependencies": {
+    "yahoo-finance2": "^2.11.3"
+  }
+}
