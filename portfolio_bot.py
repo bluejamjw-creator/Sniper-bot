@@ -243,7 +243,7 @@ def analyse():
             bars = "█" * int(conf / 10)
 
             lines.append(
-                f"🚀 {s.get('asset')} — {conf}%
+            f"🚀 {s.get('asset')} — {conf}%\n"
 "
                 f"Entry: {s.get('entry')} | SL: {s.get('sl')} | TP: {s.get('tp')}
 "
