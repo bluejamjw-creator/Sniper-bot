@@ -2,6 +2,9 @@
   "name": "sniper-bot",
   "version": "1.0.0",
   "main": "sniper.js",
+  "scripts": {
+    "start": "node sniper.js"
+  },
   "dependencies": {
     "axios": "^1.6.0"
   }
