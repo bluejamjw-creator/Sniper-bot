@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 echo "Starting loop..."
 
@@ -10,6 +10,6 @@ do
   echo "Running sniper..."
   node sniper.js || echo "Sniper failed"
 
-  echo "Sleeping 5 minutes..."
-  sleep 300
+  echo "Sleeping 15 minutes..."
+  sleep 900
 done
