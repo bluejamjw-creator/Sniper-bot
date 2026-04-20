@@ -36,8 +36,11 @@ let timer = null;
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
+if (!fs.existsSync(SIGNAL_FILE)) 
 if (!fs.existsSync(SIGNAL_FILE)) {
   fs.writeFileSync(SIGNAL_FILE, "[]
+", "utf8");
+}
 ", "utf8");
 }
 
