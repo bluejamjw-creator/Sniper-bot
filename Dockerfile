@@ -1,22 +1,17 @@
 FROM node:20-bullseye
 
-ENV PYTHONUNBUFFERED=1
-ENV DATA_DIR=/app/data
-
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends python3 python3-pip \
-  && rm -rf /var/lib/apt/lists/*
-
+# Set working directory
 WORKDIR /app
 
+# Install Node dependencies first (better caching)
 COPY package*.json ./
 RUN npm install --omit=dev
 
-COPY requirements.txt ./
-RUN pip3 install --no-cache-dir -r requirements.txt
-
+# Copy all project files
 COPY . .
 
-RUN chmod +x start.sh
+# Ensure data folder exists
+RUN mkdir -p /app/data
 
-CMD ["sh", "-c", "./start.sh"]
+# Start the bot
+CMD ["node", "sniper.js"]
