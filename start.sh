@@ -1,15 +1,8 @@
 #!/bin/sh
 
-echo "Starting services..."
+echo "Starting Sniper..."
 
-# Start portfolio bot in background loop
-while true; do
-  echo "=== PORTFOLIO CYCLE ==="
-  python3 portfolio_bot.py
-  sleep 300
-done &
-
-# Start sniper in foreground loop (keeps container alive)
+# Run sniper continuously
 while true; do
   echo "=== SNIPER CYCLE ==="
   node sniper.js
