@@ -179,22 +179,18 @@ def run():
 
     actions = build_actions(holdings)
 
-if actions != "No actions":
+# Only send meaningful actions (no spam)
+if any(x in actions for x in ["ADD", "SWAP"]):
     print("🧠 ACTIONS:", actions)
-    send("🧠 ACTIONS\n\n" + actions)
+    send(f"<b>🧠 PORTFOLIO ACTIONS</b>\n\n{actions}")
 
-    # 🔕 ONLY SEND IMPORTANT STUFF
-    if "ADD" in actions or "SWAP" in actions:
-        msg = f"<b>🧠 PORTFOLIO ACTIONS</b>\n\n{actions}"
-        send(msg)
+
 
 # =======================
 # LOOP
 # =======================
 def main_loop():
     while True:
-
-        print("=== PORTFOLIO CYCLE ===", format_uk_time())
 
         try:
             run()
