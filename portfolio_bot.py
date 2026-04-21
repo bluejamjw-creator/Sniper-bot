@@ -2,8 +2,10 @@ import json
 import requests
 from datetime import datetime
 
-BOT_TOKEN = None
-CHAT_ID = None
+import os
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
 POT_ORDER = ["core", "aggressive", "crypto"]
 
