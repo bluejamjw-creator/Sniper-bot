@@ -177,7 +177,11 @@ def run():
     total, values, prices, holdings = calculate_portfolio()
     actions = build_actions(holdings)
 
+    actions = build_actions(holdings)
+
+if actions != "No actions":
     print("🧠 ACTIONS:", actions)
+    send("🧠 ACTIONS\n\n" + actions)
 
     # 🔕 ONLY SEND IMPORTANT STUFF
     if "ADD" in actions or "SWAP" in actions:
