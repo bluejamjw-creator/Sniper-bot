@@ -474,3 +474,6 @@ async function runCycle() {
 
 runCycle();
 setInterval(runCycle, 300000);
+
+// 🔒 keep Railway alive
+setInterval(() => {}, 60000);
