@@ -3,6 +3,5 @@
 echo "Starting services..."
 
 python3 portfolio_bot.py &
-node sniper.js
 
-wait
+exec node sniper.js
