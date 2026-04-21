@@ -180,6 +180,7 @@ def run():
     actions = build_actions(holdings)
 
 # Only send meaningful actions (no spam)
+actions = []
 if any(x in actions for x in ["ADD", "SWAP"]):
     print("🧠 ACTIONS:", actions)
     send(f"<b>🧠 PORTFOLIO ACTIONS</b>\n\n{actions}")
