@@ -1,21 +1,8 @@
-#!/bin/bash
+#!/bin/sh
 
-echo "Starting loop..."
+echo "Starting services..."
 
-while true
-do
-  echo "======================"
-  echo "New cycle: $(date)"
-  echo "======================"
+python3 portfolio_bot.py &
+node sniper.js
 
-  echo "Running portfolio..."
-  python3 portfolio_bot.py || echo "Portfolio failed"
-
-  echo "Running sniper..."
-  node sniper.js || echo "Sniper failed"
-
-  echo "Cycle complete"
-
-  echo "Sleeping 5 minutes..."
-  sleep 300
-done
+wait
