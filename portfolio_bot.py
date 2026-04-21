@@ -201,7 +201,16 @@ def build_actions(holdings):
         if s["confidence"] > 70:
             actions.append(f"🔥 ADD {s['asset']} ({s['confidence']}%)")
 
-    return "\n\n".join(actions) if actions else "No actions"
+    actions_text = "\n\n".join(actions) if actions else "No actions"
+
+# SAVE FOR BOLT
+try:
+    with open("/app/data/actions.json", "w") as f:
+        json.dump(actions, f, indent=2)
+except Exception as e:
+    print("actions.json error:", e)
+
+return actions_text
 
 
 # =======================
