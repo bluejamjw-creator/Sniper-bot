@@ -300,9 +300,7 @@ app.get("/stats",(req,res)=>{
     closed:closed.length,
     pnl:pnl.toFixed(2)
   });
+
+  app.listen(PORT, "0.0.0.0", () => {
+  console.log(`API running on port ${PORT}`);
 });
-
-app.listen(PORT,()=>console.log("API running"));
-
-// keep alive
-setInterval(()=>{},60000);
