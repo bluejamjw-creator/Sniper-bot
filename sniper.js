@@ -279,3 +279,5 @@ app.get("/stats",(req,res)=>{
 });
 
 app.listen(PORT,()=>console.log("API running"));
+// keep process alive (Railway stability fix)
+setInterval(() => {}, 60000);
