@@ -270,6 +270,15 @@ def build_portfolio_summary():
 # =======================
 def run():
     ensure_files()
+
+    import os
+    signals_path = "/app/data/signals.json"
+
+    if os.path.exists(signals_path):
+        print("✅ signals.json EXISTS")
+    else:
+        print("❌ signals.json MISSING")
+
     msg = build_buy_plan(get_targets()) + "\n\n" + build_portfolio_summary()
     print(msg)
     send(msg)
