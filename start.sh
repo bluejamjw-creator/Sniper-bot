@@ -1,10 +1,9 @@
 #!/bin/sh
 
-echo "Starting Sniper..."
+echo "Starting services..."
 
-# Run sniper continuously
-while true; do
-  echo "=== SNIPER CYCLE ==="
-  node sniper.js
-  sleep 300
-done
+# Start portfolio bot (runs its own loop)
+python3 portfolio_bot.py &
+
+# Start sniper (runs continuously with internal loop)
+node sniper.js
