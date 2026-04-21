@@ -288,9 +288,8 @@ app.get("/",(req,res)=>{
 
 app.get("/trades",(req,res)=>{
   res.json(load(TRADES_FILE));
-});
 
-app.get("/stats",(req,res)=>{
+  app.get("/stats",(req,res)=>{
   const trades = load(TRADES_FILE);
   const closed = trades.filter(t=>t.status==="closed");
   const pnl = closed.reduce((a,t)=>a+(t.pnl||0),0);
@@ -300,7 +299,8 @@ app.get("/stats",(req,res)=>{
     closed:closed.length,
     pnl:pnl.toFixed(2)
   });
+}); //
 
-  app.listen(PORT, "0.0.0.0", () => {
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`API running on port ${PORT}`);
 });
