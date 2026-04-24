@@ -99,7 +99,7 @@ const CRYPTO_PAIRS = [
   "PEPEUSDT",
   "WIFUSDT",
   "FETUSDT",
-  "RNDRUSDT",
+  "RENDERUSDT",
 
   "TAOUSDT",
   "ONDOUSDT",
