@@ -1,5 +1,5 @@
 // ================================================================
-// SNIPER V43
+// SNIPER V34
 // ELITE MOMENTUM BREAKOUT SCANNER
 // CRYPTO + US STOCKS + LSE
 // READY / WATCH / MOMENTUM BUILDING
