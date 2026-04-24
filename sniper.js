@@ -47,7 +47,7 @@ const FILES = {
 // SETTINGS
 // ================================================================
 
-const MAX_SIGNALS_PER_CYCLE = 8;
+const MAX_SIGNALS_PER_CYCLE = 3;
 
 const MIN_CONFIDENCE = 55;
 
@@ -1148,17 +1148,16 @@ ULTRA AGGRESSIVE
 
 Scanning for momentum breakouts...`
 
-    );
-
-    runCycle();
-
-    // 10 MINUTES
-
-    setInterval(
-      runCycle,
-      600000
-    );
-
-  }
-
 );
+
+setTimeout(runCycle, 5000);
+
+setTimeout(() => {
+
+  setInterval(
+    runCycle,
+    600000
+  );
+
+}, 15000);
+  
