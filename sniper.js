@@ -90,34 +90,75 @@ const ENABLE_LSE = true;
 
 const CRYPTO_PAIRS = [
 
+  // MAJORS
   "BTCUSDT",
   "ETHUSDT",
   "SOLUSDT",
   "XRPUSDT",
   "DOGEUSDT",
+  "BNBUSDT",
 
-  "AVAXUSDT",
-  "LINKUSDT",
-  "INJUSDT",
-  "SUIUSDT",
-
-  "SEIUSDT",
-  "PEPEUSDT",
-
+  // AI / MOMENTUM
   "FETUSDT",
   "RENDERUSDT",
-
   "TAOUSDT",
-  "ONDOUSDT",
 
+  // STRONG TREND MOVERS
+  "DYDXUSDT",
+  "SEIUSDT",
+  "INJUSDT",
+  "SUIUSDT",
+  "ONDOUSDT",
+  "ARBUSDT",
+
+  // MEME / RETAIL
+  "PEPEUSDT",
+  "BONKUSDT",
+  "WIFUSDT",
+  "APEUSDT",
+
+  // VOLATILE ROTATION
+  "API3USDT",
+  "SAFEUSDT",
+  "HIGHUSDT",
+  "BIGTIMEUSDT",
+
+  "BLURUSDT",
+  "CTSIUSDT",
+  "ILVUSDT",
+
+  "AXSUSDT",
+  "ALICEUSDT",
+
+  "GALAUSDT",
+  "SANDUSDT",
+  "MANAUSDT",
+
+  "CHZUSDT",
+  "ROSEUSDT",
+
+  "JASMYUSDT",
+  "ACHUSDT",
+
+  // DEFI
+  "AAVEUSDT",
+  "UNIUSDT",
+  "LDOUSDT",
+
+  // ECOSYSTEM
   "HBARUSDT",
+  "LINKUSDT",
+  "NEARUSDT",
+
+  "APTUSDT",
+  "TIAUSDT",
+
+  "PYTHUSDT",
   "ENSUSDT",
 
-  "DYDXUSDT",
-  "UNIUSDT",
-
+  // EXTRA VOLATILITY
   "ETCUSDT",
-  "APEUSDT"
+  "NEIROUSDT"
 
 ];
 
