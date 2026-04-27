@@ -1006,8 +1006,21 @@ function analyse(
       ...lows.slice(-5)
     );
 
-  const sl =
-    recentLow * 0.995;
+  const rawSl =
+  recentLow * 0.995;
+
+const minStopDistance = 0.015;
+
+const maxSl =
+
+  entry *
+  (1 - minStopDistance);
+
+const sl =
+  Math.min(
+    rawSl,
+    maxSl
+  );
 
   // ============================================================
   // TARGET
