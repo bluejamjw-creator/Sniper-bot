@@ -1342,7 +1342,7 @@ function analyse(
       "LIMIT BUY";
 
     entry =
-      last * 0.992;
+      last * 0.996;
 
   } else if (
     continuation
@@ -1352,7 +1352,7 @@ function analyse(
       "LIMIT BUY";
 
     entry =
-      ema20 * 1.002;  // just above EMA20 — buy the grind near support
+      ema20 * 0.997;  // just above EMA20 — buy the grind near support
 
   } else if (
     breakoutSignal
