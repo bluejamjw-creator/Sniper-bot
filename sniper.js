@@ -1349,10 +1349,10 @@ function analyse(
   ) {
 
     entryType =
-      "LIMIT BUY";
+      "STOP BUY";
 
     entry =
-      ema20 * 0.997;  // just above EMA20 — buy the grind near support
+      ema20 * 1.0015;  // just above EMA20 — buy the grind near support
 
   } else if (
     breakoutSignal
