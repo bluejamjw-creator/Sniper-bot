@@ -1,6 +1,6 @@
 {
   "name": "sniper",
-  "version": "74.0.0",
+  "version": "75.0.0",
   "main": "sniper.js",
   "scripts": {
     "start": "node sniper.js"
