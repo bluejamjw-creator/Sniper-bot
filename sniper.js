@@ -738,10 +738,12 @@ async function processSignals(signals) {
     const slotKey = getSlotKey(s.market);
     if (!slotKey || MAX_POSITIONS[slotKey] === 0) continue;
 
-    if (s.score < MIN_SCORE_TO_TRADE) {
-      console.log(`SKIPPED ${s.asset} — score too low`);
-      continue;
-    }
+const minScore = s.market === "CRYPTO" ? 60 : 70;
+
+if (s.score < minScore) {
+  console.log(`SKIPPED ${s.asset} — score too low`);
+  continue;
+}
 
     const currentTrade = getCurrentOpenTradeInBucket(trades, s.market);
 
