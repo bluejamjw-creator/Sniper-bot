@@ -190,8 +190,7 @@ function ema(values, period) {
 }
 
 function lines(parts) {
-  return parts.join("
-");
+  return parts.join("\n");
 }
 
 function escapeHtml(value) {
