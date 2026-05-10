@@ -247,8 +247,7 @@ function escapeHtml(value) {
 }
 
 function lines(parts) {
-  return parts.join("
-");
+  return parts.join("/n");
 }
 
 function ensureFiles() {
