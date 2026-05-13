@@ -2362,7 +2362,7 @@ server = app.listen(PORT, "0.0.0.0", async () => {
     "",
     "Dual-mode scanner: Trend Continuation + Momentum Runner",
     "Move maturity: base > expansion > continuation > climax",
-    ""Parabolic exhaustion hard block active",
+    "Parabolic exhaustion hard block active",
     "Supabase: " + (supabaseEnabled ? "ENABLED" : "DISABLED -- local JSON only"),
     "Heating up alerts: permanently removed"
   ])));
