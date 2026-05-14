@@ -1716,7 +1716,7 @@ function analyse(asset, candles, market) {
     log(`⛔ ${asset} -- no setup (break=${breakoutSignal} pull=${pullbackSignal} gap=${gapContinuationSignal} ign=${ignitionSignal} fpc=${firstPullbackCont} pbe=${preBreakoutExpansion} vol=${volRatio.toFixed(2)}x)`);
     return null;
   }
-
+let setupType = "BREAKOUT_CONTINUATION";
   if (gapContinuationSignal)                              setupType = "GAP_CONTINUATION";
   else if (ignitionSignal)                                setupType = "MOMENTUM_IGNITION";
   else if (preBreakoutExpansion && !ignitionSignal)       setupType = "PRE_BREAKOUT_EXPANSION";
