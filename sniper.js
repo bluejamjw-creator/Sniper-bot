@@ -333,7 +333,9 @@ let server            = null;
 
 // ── Utilities ────────────────────────────────────────────────────
 function nowIso()         { return new Date().toISOString(); }
-function log(...args)     { console.log([${nowIso()}], ...args); }
+function log(...args) {
+  console.log(`[${nowIso()}]`, ...args);
+}
 function sleep(ms)        { return new Promise(r => setTimeout(r, ms)); }
 async function throttle() { await sleep(REQUEST_DELAY_MS); }
 function dedup(arr)       { return [...new Set(arr.filter(Boolean))]; }
