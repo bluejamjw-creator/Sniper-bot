@@ -85,7 +85,7 @@ realtime: { transport: ws }  // required for Node 20 -- native WebSocket not ava
 : null;
 
 if (supabaseEnabled) {
-console.log(✅ Supabase enabled -- ${SUPABASE_URL});
+  console.log("✅ Supabase enabled -- " + SUPABASE_URL);
 } else {
 console.log("⚠️ Supabase DISABLED -- using local JSON (check SUPABASE_URL and SUPABASE_SERVICE_KEY)");
 }
