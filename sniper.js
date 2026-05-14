@@ -2347,7 +2347,7 @@ async function gracefulShutdown(signal) {
 if (shuttingDown) return;
 shuttingDown = true; ready = false;
 clearRuntimeTimers();
-log(🛑 ${signal} received);
+log(`🛑 ${String(signal)} received`);
 try {
 const [trades, alerts] = await Promise.all([loadTrades(), loadAlerts()]);
 await Promise.all([saveTrades(trades), saveAlerts(alerts)]);
