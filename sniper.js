@@ -2395,12 +2395,17 @@ await sendPrivate(
 log(`✅ Supabase connection test passed`);
 }
 } catch (e) {
-log(`❌ Supabase connection test exception: ${e.message}`);
-await sendPrivate(`⚠️ <b>Supabase connection exception</b>\n${e.message}`);
+  log(`❌ Supabase connection test exception: ${e.message}`);
+
+  await sendPrivate(
+    `⚠️ <b>Supabase connection exception</b>\n${e.message}`
+  );
 }
-}
+
 await sleep(STARTUP_DELAY_MS);
-await safeRun("initialPools",  refreshDynamicPools);
+
+await safeRun("initialPools", refreshDynamicPools);
+
 ready = true;
 log("\u2705 SNIPER V91 READY");
 await safeRun("initialCycle", safeCycle);
