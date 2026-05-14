@@ -2371,7 +2371,7 @@ process.on("SIGTERM", () => void gracefulShutdown("SIGTERM"));
 ensureFiles();
 
 server = app.listen(PORT, "0.0.0.0", async () => {
-log(🚀 SNIPER V91 on port ${PORT});
+log(`🚀 SNIPER V91 on port ${PORT}`);
 await safeRun("bootTelegram", () => sendPrivate(lines([
 "\uD83D\uDE80 SNIPER V91 LIVE -- MOMENTUM MATURITY ENGINE",
 "",
