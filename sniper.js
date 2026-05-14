@@ -2388,13 +2388,13 @@ try {
 const { error } = await supabase.from("trades").select("id").limit(1);
 if (error) {
 log(`❌ Supabase connection test FAILED: ${error.message}`);
-await sendPrivate(\u26a0\ufe0f <b>Supabase connection failed</b>\n${error.message}\nFalling back to local JSON.);
+await sendPrivate(\u26a0\ufe0f <b>Supabase connection failed</b>\n${error.message}\nFalling back to local JSON.`);
 } else {
-log("✅ Supabase connection test passed");
+log("✅ Supabase connection test passed"`);
 }
 } catch (e) {
-log(`❌ Supabase connection test exception: ${e.message});
-await sendPrivate(\u26a0\ufe0f <b>Supabase connection exception</b>\n${e.message});
+log(`❌ Supabase connection test exception: ${e.message}`);
+await sendPrivate(\u26a0\ufe0f <b>Supabase connection exception</b>\n${e.message}`);
 }
 }
 await sleep(STARTUP_DELAY_MS);
