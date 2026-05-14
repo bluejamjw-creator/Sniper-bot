@@ -2394,7 +2394,7 @@ log("✅ Supabase connection test passed");
 }
 } catch (e) {
 log(`❌ Supabase connection test exception: ${e.message}`);
-await sendPrivate(\u26a0\ufe0f <b>Supabase connection exception</b>\n${e.message}`);
+await sendPrivate(`\u26a0\ufe0f <b>Supabase connection exception</b>\n${e.message}`);
 }
 }
 await sleep(STARTUP_DELAY_MS);
