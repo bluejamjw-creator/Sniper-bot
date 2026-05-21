@@ -2432,7 +2432,7 @@ async function processSignals(signals) {
     if (alerts.some(a => a.id===alertId)) { log(`⏳ Dedup blocked ${signal.asset}`); continue; }
     if (trades.some(t => t.asset===signal.asset && t.status==="PENDING")) { log(`⏳ Pending exists ${signal.asset}`); continue; }
 
-    await safeRun(`signal${signal.asset}`, () => sendBoth(buildSignalMessage(signal, size)));
+    await safeRun(`signal${signal.asset}`, () => sendChannel(buildSignalMessage(signal, size)));
     lastSignalTime = Date.now();
 
     // Phase 2 evidence logging -- track everything needed for later statistical analysis
