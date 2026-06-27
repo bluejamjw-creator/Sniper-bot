@@ -6513,9 +6513,4 @@ server = app.listen(PORT, "0.0.0.0", async () => {
   setTimeout(() => void sniperLoop(), 5000);  // Sniper starts 5s after boot
   setTimeout(() => void warmLoop(),   10000); // Warm starts 10s after boot
   log("🎯 V100 Sniper Engine armed -- HOT loop: 12s | WARM loop: 30s | Open Mode: 8s");
-}
-
-main().catch(err => {
-  console.error(err);
-  process.exit(1);
 });
