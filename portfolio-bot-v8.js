@@ -90,7 +90,7 @@ const CONFIG = {
   reopenCooldownMs: 90 * 60 * 1000,
   closeCooldownMs: 60 * 60 * 1000,
 
-  maxOpenPositions: 3,
+  maxOpenPositions: 10,
   holdMinScoreImprovement: 0.05,
 
   openSimilarityThreshold: 0.70,
