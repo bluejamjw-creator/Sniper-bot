@@ -606,7 +606,7 @@ const CONFIG = {
   reopenCooldownMs: 90 * 60 * 1000,
   closeCooldownMs: 60 * 60 * 1000,
 
-  maxOpenPositions: 5,
+  maxOpenPositions: 3,
   holdMinScoreImprovement: 0.05,
 
   openSimilarityThreshold: 0.70,
@@ -614,7 +614,7 @@ const CONFIG = {
   minPositiveExamples: 20,
 
   creamMinScore: 70,
-  creamMaxOpenPerCycle: 2,
+  creamMaxOpenPerCycle: 1,
 
   creamMinRet15m: 0.001,
   creamMinRet1h: 0.003,
@@ -711,6 +711,15 @@ const CONFIG = {
   // disable. Ascending order. Costs no extra DB reads (one write to the
   // position row only when the stop actually moves).
   stopLadder: [{ at: 5, lockPct: 2 }],
+  // LIVE (12 Oct): late-entry veto. Skip any coin already up more than
+  // `ret24hMax` over the last 24h. Replay (SL -14 / TP +20): signals up
+  // 10-20% averaged -1.7% per trade and >20% averaged -8.0%, versus
+  // +0.1% to +2.0% for the rest. Small sample (43 in the weak groups):
+  // a reversible experiment — set enabled:false to revert. Do not change
+  // the threshold mid-test; review after a pre-set number of closed trades.
+  // Vetoed detections are still scored and stored, flagged
+  // late_entry_vetoed_live, so blocked and taken signals can be compared.
+  lateEntryVeto: { enabled: true, ret24hMax: 0.10, reason: 'late_entry_24h_gt_10' },
   statsRefreshMs: 4 * 60 * 60 * 1000,
   eodReportHourUtc: 20, // 20:00 UTC = 21:00 BST / 20:00 GMT
   learningModelRefreshMs: 2 * 60 * 60 * 1000,
@@ -818,8 +827,8 @@ const CFG = {
   maxDayChange: 12,            // above this the move has already happened
   minRangePos: 0.8,            // price in top 20% of the day's range
   targets: [10, 25, 50, 100],
-  maxOpen: 5,
-  maxNewPerCycle: 2,
+  maxOpen: 2,
+  maxNewPerCycle: 1,
   maxQuoteAgeMs: 30 * 60 * 1000,   // a quote older than this is not 'now' (e.g. Friday's close on Monday)
   lockAtPct: 5, lockPct: 2,
   slMinPct: 3, slMaxPct: 8, slRangeMult: 1.5, tpR: 4,
@@ -5907,6 +5916,19 @@ async function rankOpenCandidates(
       continue;
     }
 
+    // Late-entry veto (see CONFIG.lateEntryVeto): only logged for
+    // candidates that would otherwise have been eligible.
+    if (
+      CONFIG.lateEntryVeto?.enabled &&
+      detection.features.ret24h > CONFIG.lateEntryVeto.ret24hMax
+    ) {
+      console.log(
+        `[HUNTER] ${CONFIG.lateEntryVeto.reason}: skipped ${detection.symbol} ` +
+        `(24h ${(detection.features.ret24h * 100).toFixed(1)}%, score ${detection.creamScore.toFixed(0)})`
+      );
+      continue;
+    }
+
     const permission =
       await canOpen(
         detection.symbol
@@ -6876,6 +6898,11 @@ async function runCycle() {
         late_entry_would_veto:
           detection.features.ret4h > 0.10 ||
           detection.features.ret24h > 0.15,
+        late_entry_24h_gt_10:
+          detection.features.ret24h > 0.10,
+        late_entry_vetoed_live:
+          Boolean(CONFIG.lateEntryVeto?.enabled) &&
+          detection.features.ret24h > CONFIG.lateEntryVeto.ret24hMax,
       };
     }
 
