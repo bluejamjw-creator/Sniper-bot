@@ -8442,6 +8442,9 @@ async function runPickerBacktest() {
     pickerTiltOff = true;
     let nav = 1, peak = 1, mdd = 0, held = [], pending = null;
     const trades = [], navCurve = [];
+    const CASES = ["INJUSDT", "NEARUSDT", "QNTUSDT", "MRNA"];
+    const diag = Object.fromEntries(CASES.map(c => [c, {}]));
+    const allWhy = {}; let regDays = { n: 0, stock: 0, crypto: 0 };
     const dayEnd = t => t + DAY - 1;
     const end = btcAll[btcAll.length - 1].t;
     const barOn = (sym, d) => { const a = all[sym]; if (!a) return null; const i = idxAt(a.bars, d); return i >= 0 && a.bars[i].t >= d - 4 * DAY ? { b: a.bars[i], i, same: a.bars[i].t >= d } : null; };
@@ -8496,6 +8499,12 @@ async function runPickerBacktest() {
         if (s.ok && s.cls === "stock" && !sReg.ok) { s.ok = false; s.why = "stock regime down"; }
         if (s.ok && s.cls === "crypto" && !cReg.ok) { s.ok = false; s.why = "crypto regime down"; }
       }
+      regDays.n++; if (sReg.ok) regDays.stock++; if (cReg.ok) regDays.crypto++;
+      for (const s of scores) {
+        const k = s.ok ? "ok" : (s.why || "other");
+        allWhy[`${s.cls}:${k}`] = (allWhy[`${s.cls}:${k}`] || 0) + 1;
+        if (diag[s.sym]) diag[s.sym][k] = (diag[s.sym][k] || 0) + 1;
+      }
       const bySym = Object.fromEntries(scores.filter(s => s.price).map(s => [s.sym, s]));
       const ranked = scores.filter(s => s.ok).sort((a, b) => b.score - a.score);
       const picks = pickerChoose(ranked, held.map(h => ({ sym: h.sym, cls: h.cls, stop: h.stop })), bySym);
@@ -8528,6 +8537,11 @@ async function runPickerBacktest() {
       if (!mine.length) { L.push(`${sym.replace("USDT", "")}: never entered (buy-and-hold ${f(hold)})`); continue; }
       L.push(`${sym.replace("USDT", "")} (buy-and-hold ${f(hold)}): ` + mine.map(t => `${dt(t.entryT)}→${t.exitT ? dt(t.exitT) : "open"} ${f(t.ret)}`).join("; "));
     }
+    L.push("");
+    L.push("<b>Why they were not entered</b> (days by first failing test)");
+    for (const c of CASES) { const d = diag[c]; const tot = Object.values(d).reduce((a, b) => a + b, 0); L.push(`${c.replace("USDT", "")}: ` + (tot ? Object.entries(d).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k} ${v}`).join(", ") : "no scored days (history too short or missing)")); }
+    L.push(`Market gate open: stocks ${regDays.n ? Math.round((regDays.stock / regDays.n) * 100) : 0}% of days · crypto ${regDays.n ? Math.round((regDays.crypto / regDays.n) * 100) : 0}%`);
+    for (const cl of ["stock", "crypto"]) { const e = Object.entries(allWhy).filter(([k]) => k.startsWith(cl + ":")); const t = e.reduce((a, [, v]) => a + v, 0); L.push(`All ${cl}s: ` + e.sort((a, b) => b[1] - a[1]).slice(0, 6).map(([k, v]) => `${k.split(":")[1]} ${Math.round((v / Math.max(t, 1)) * 100)}%`).join(", ")); }
     const sorted = [...trades].sort((a, b) => a.ret - b.ret);
     L.push("");
     L.push("<b>Worst 5 trades</b>: " + (sorted.slice(0, 5).map(t => `${t.sym.replace("USDT", "")} ${f(t.ret)}`).join(", ") || "none"));
