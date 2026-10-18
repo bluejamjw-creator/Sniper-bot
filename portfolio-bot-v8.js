@@ -1,16 +1,18 @@
 // =====================================================================================
-// portfolio-bot-v8.js — fomo-watch 🏹 (temporarily replacing Hunter; Hunter backup: portfolio-bot-v8-hunter-backup.js)
+// portfolio-bot-v8.js — fomo-watch v2 🏹 (data from fomoapi.io; temporarily replacing Hunter — Hunter backup: portfolio-bot-v8-hunter-backup.js)
 // Follows consistently profitable Fomo traders and alerts the private Telegram channel
 // when 3+ of them buy the same token within 4 hours. Observation mode tracks every
 // alert's outcome for 7 days and sends a weekly evidence report (Sunday ~18:00 UK).
 //
-// Single file, no npm packages. Needs Node 22.13+ (built-in SQLite).
+// Single file, no npm packages. Needs Node 22.13+ (built-in SQLite and WebSocket).
 //   node portfolio-bot-v8.js          run the bot
-//   node portfolio-bot-v8.js probe    print the live cope.capital response shapes (uses 3 calls)
+//   node portfolio-bot-v8.js probe    check the fomoapi.io key, data shapes and live feed (~750 credits)
 //   node portfolio-bot-v8.js report   print the evidence report
 //
-// Data: cope.capital (independent API on Fomo's leaderboard + on-chain wallets, free tier)
-//       and DexScreener for prices. Storage: SQLite at DB_PATH (put on a Railway volume).
+// Data: fomoapi.io (Fomo leaderboard, trader positions, live buy feed over WebSocket;
+//       free key = 250,000 credits/month) and DexScreener for prices.
+// Storage: SQLite at DB_PATH (put on a Railway volume mounted at /data).
+// The bot never crash-loops: if the key is missing or the API is down it logs why and retries.
 // =====================================================================================
 
 'use strict';
@@ -47,9 +49,10 @@ const bool = (name, def) => {
 
 const CFG = {
   // --- Secrets / wiring ---
-  COPE_API_KEY: str('COPE_API_KEY', ''),              // auto-registered on first run if empty
-  COPE_BASE_URL: str('COPE_BASE_URL', 'https://api.cope.capital'),
-  // Falls back to Hunter's variable names, so it runs in the Sniper-bot service with no new variables.
+  FOMOAPI_KEY: str('FOMOAPI_KEY', ''),                 // free key from fomoapi.io/dashboard (required)
+  FOMOAPI_BASE_URL: str('FOMOAPI_BASE_URL', 'https://api.fomoapi.io'),
+  FOMOAPI_WS_URL: str('FOMOAPI_WS_URL', 'wss://api.fomoapi.io/ws/alerts'),
+  // Falls back to Hunter's variable names, so it runs in the Sniper-bot service with no new Telegram variables.
   TELEGRAM_BOT_TOKEN: str('TELEGRAM_BOT_TOKEN', str('BOT_TOKEN', '')),
   TELEGRAM_CHANNEL_ID: str('TELEGRAM_CHANNEL_ID', str('CHANNEL_CHAT_ID', '')), // private channel, e.g. -100xxxxxxxxxx
   DB_PATH: str('DB_PATH', '/data/fomo-watch.db'),       // Railway volume mounted at /data
@@ -60,10 +63,12 @@ const CFG = {
 
   // --- Who to follow ("consistent winners") ---
   TRACKED_MAX: num('TRACKED_MAX', 30),
-  MIN_WIN_RATE: num('MIN_WIN_RATE', 55),               // % — applied when the API reports it
-  MIN_TRADES: num('MIN_TRADES', 20),                   // closed trades — filters one-lucky-trade wallets
+  MIN_WIN_RATE: num('MIN_WIN_RATE', 55),               // % of recent closed positions in profit
+  MIN_CLOSED_FOR_WIN_RATE: num('MIN_CLOSED_FOR_WIN_RATE', 10), // fewer closed positions than this = win rate not judged
+  MIN_TRADES: num('MIN_TRADES', 20),                   // trades on the 30d board — filters one-lucky-trade wallets
   LEADERBOARD_DEPTH: num('LEADERBOARD_DEPTH', 150),
   REFRESH_TRADERS_HOURS: num('REFRESH_TRADERS_HOURS', 24),
+  WIN_RATE_REFRESH_DAYS: num('WIN_RATE_REFRESH_DAYS', 7), // each trader's win rate costs 250 credits, so weekly
 
   // --- Trigger: several top traders agree ---
   MIN_TRADERS: num('MIN_TRADERS', 3),
@@ -74,12 +79,11 @@ const CFG = {
   EXCLUDE_SYMBOLS: str('EXCLUDE_SYMBOLS', 'SOL,WSOL,USDC,USDT,ETH,WETH,CBBTC,WBTC,DAI,USDE,PYUSD')
     .split(',').map((s) => s.trim().toUpperCase()).filter(Boolean),
 
-  // --- API budget (cope.capital free tier: 250 counted calls/day, 10 req/min) ---
-  DAILY_COUNTED_BUDGET: num('DAILY_COUNTED_BUDGET', 230),
-  MIN_REQUEST_GAP_MS: num('MIN_REQUEST_GAP_MS', 6500),
-  POLL_SECONDS: num('POLL_SECONDS', 180),
-  ACTIVITY_LIMIT: num('ACTIVITY_LIMIT', 100),
-  ACTIVITY_OVERLAP_SECONDS: num('ACTIVITY_OVERLAP_SECONDS', 120),
+  // --- API budget (fomoapi.io free key: 250,000 credits/month, 20 requests/min) ---
+  DAILY_CREDIT_BUDGET: num('DAILY_CREDIT_BUDGET', 7000), // ~210k/month, leaves headroom
+  MIN_REQUEST_GAP_MS: num('MIN_REQUEST_GAP_MS', 3500),   // ~17 requests/min, under the 20/min limit
+  WS_SILENCE_RECONNECT_SECONDS: num('WS_SILENCE_RECONNECT_SECONDS', 600), // reconnect if the feed goes quiet
+  BACKFILL_MAX_PER_DAY: num('BACKFILL_MAX_PER_DAY', 12), // REST catch-up after a feed drop (125 credits each)
 
   // --- Outcome tracking ---
   OUTCOME_CHECK_MINUTES: num('OUTCOME_CHECK_MINUTES', 15),
@@ -114,7 +118,7 @@ const log = {
   error: (m, e) => logOut('error', m, e),
 };
 
-// cope.capital's exact response shapes aren't fully documented, so every reader tries
+// fomoapi.io's exact response shapes aren't all documented, so every reader tries
 // several likely field names. Run `node portfolio-bot-v8.js probe` to see the real shapes.
 function pickArray(body, keys = ['data', 'items', 'results', 'activity', 'trades', 'traders', 'leaderboard', 'events']) {
   if (Array.isArray(body)) return body;
@@ -251,6 +255,9 @@ function dbOpen(dbPath = CFG.DB_PATH) {
     CREATE INDEX IF NOT EXISTS alerts_token ON alerts (chain, mint, created_at);
     CREATE INDEX IF NOT EXISTS alerts_open ON alerts (done, created_at);
 
+    -- Per-trader win rate from recent closed positions (cached; each check costs credits).
+    CREATE TABLE IF NOT EXISTS trader_stats (handle TEXT PRIMARY KEY, win_rate REAL, closed_n INTEGER, checked_at INTEGER NOT NULL);
+
     -- API usage and fetch health (saturated = some buys in that window may be missing).
     CREATE TABLE IF NOT EXISTS fetch_log (ts INTEGER NOT NULL, endpoint TEXT NOT NULL, status INTEGER, rows INTEGER, saturated INTEGER DEFAULT 0);
     CREATE INDEX IF NOT EXISTS fetch_log_ts ON fetch_log (ts);
@@ -271,31 +278,34 @@ function dbClose() {
 }
 
 // =====================================================================================
-// SECTION 4 — COPE.CAPITAL CLIENT (enforces the free tier's daily budget and rate limit)
+// SECTION 4 — FOMOAPI.IO CLIENT (enforces the free key's credit budget and rate limit)
+// Credit costs: leaderboard / positions = 250, alerts catch-up = 125. The live WebSocket feed
+// is separate (Section 9).
 // =====================================================================================
 
-const COUNTED = [/^\/v1\/activity(\?|$)/, /^\/v1\/leaderboard/, /^\/v1\/tokens\//];
-let apiKey = '';
 let lastRequestAt = 0;
 let requestChain = Promise.resolve();
 
 const utcDay = (t = Date.now()) => new Date(t).toISOString().slice(0, 10);
-const budgetUsed = () => Number(kvGet(`budget:${utcDay()}`) || 0);
-function budgetLeft() {
-  if (kvGet(`budget_exhausted:${utcDay()}`)) return 0;
-  return Math.max(0, CFG.DAILY_COUNTED_BUDGET - budgetUsed());
-}
-function msUntilUtcMidnight(t = Date.now()) {
-  const d = new Date(t);
-  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1) - t;
+const creditsUsed = () => Number(kvGet(`credits:${utcDay()}`) || 0);
+function creditsLeftToday() {
+  if (kvGet(`credits_exhausted:${utcDay()}`)) return 0;
+  return Math.max(0, CFG.DAILY_CREDIT_BUDGET - creditsUsed());
 }
 
-class CopeError extends Error {
+class ApiError extends Error {
   constructor(status, msg, body) {
     super(msg);
     this.status = status;
     this.body = body;
   }
+}
+
+// Network errors from fetch() say only "fetch failed"; the real reason is in e.cause.
+function netReason(e) {
+  const c = e && e.cause;
+  if (!c) return e && e.message;
+  return [c.code, c.message].filter(Boolean).join(' ') || e.message;
 }
 
 // All requests go through one queue with a minimum gap between them.
@@ -310,57 +320,48 @@ function queued(fn) {
   return run;
 }
 
-async function rawRequest(method, urlPath, body, { auth = true } = {}) {
-  const headers = { Accept: 'application/json' };
-  if (auth) headers.Authorization = `Bearer ${apiKey}`;
-  if (body) headers['Content-Type'] = 'application/json';
-  const res = await fetch(CFG.COPE_BASE_URL + urlPath, {
-    method, headers, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(20000),
-  });
-  const text = await res.text();
-  let json;
-  try { json = text ? JSON.parse(text) : null; } catch { json = { raw: text }; }
-  return { status: res.status, json };
-}
-
-async function copeRequest(method, urlPath, body) {
-  const counted = COUNTED.some((re) => re.test(urlPath));
-  if (counted && budgetLeft() <= 0) throw new CopeError(402, 'Daily counted-call budget used', null);
+async function apiGet(urlPath, estCost = 250) {
+  if (!CFG.FOMOAPI_KEY) throw new ApiError(401, 'FOMOAPI_KEY is not set', null);
+  if (creditsLeftToday() < estCost) throw new ApiError(402, 'Daily credit budget used (resets 00:00 UTC)', null);
 
   for (let attempt = 0; attempt < 3; attempt++) {
-    const { status, json } = await queued(() => rawRequest(method, urlPath, body));
-    if (counted && status !== 429) kvSet(`budget:${utcDay()}`, budgetUsed() + 1);
-    db.prepare('INSERT INTO fetch_log (ts, endpoint, status) VALUES (?, ?, ?)').run(Date.now(), urlPath.split('?')[0], status);
-
-    if (status >= 200 && status < 300) return json;
-    if (status === 402) {
-      kvSet(`budget_exhausted:${utcDay()}`, '1');
-      throw new CopeError(402, 'Free daily calls used up (resets 00:00 UTC)', json);
+    let res;
+    try {
+      res = await queued(() => fetch(CFG.FOMOAPI_BASE_URL + urlPath, {
+        headers: { Accept: 'application/json', Authorization: `Bearer ${CFG.FOMOAPI_KEY}` },
+        signal: AbortSignal.timeout(20000),
+      }));
+    } catch (e) {
+      log.warn(`fomoapi ${urlPath.split('?')[0]} network error: ${netReason(e)}`);
+      await sleep(5000 * (attempt + 1));
+      continue;
     }
-    if (status === 401) throw new CopeError(401, 'cope.capital API key rejected — check COPE_API_KEY', json);
-    if (status === 429 || status >= 500) {
-      const backoff = status === 429 ? 30000 : 5000 * (attempt + 1);
-      log.warn(`cope ${urlPath.split('?')[0]} -> ${status}, retrying in ${backoff / 1000}s`);
+    const cost = toNum(res.headers.get('x-credits-cost')) ?? (res.ok ? estCost : 0);
+    if (cost) kvSet(`credits:${utcDay()}`, creditsUsed() + cost);
+    const remaining = toNum(res.headers.get('x-credits-remaining'));
+    if (remaining !== undefined) kvSet('credits_remaining', remaining);
+
+    const text = await res.text();
+    let json;
+    try { json = text ? JSON.parse(text) : null; } catch { json = { raw: text }; }
+    db.prepare('INSERT INTO fetch_log (ts, endpoint, status, rows) VALUES (?, ?, ?, ?)').run(Date.now(), urlPath.split('?')[0], res.status, cost || 0);
+
+    if (res.ok) return json;
+    if (res.status === 402) {
+      kvSet(`credits_exhausted:${utcDay()}`, '1');
+      throw new ApiError(402, 'fomoapi.io credits used up', json);
+    }
+    if (res.status === 401 || res.status === 403) throw new ApiError(401, 'fomoapi.io key rejected — check FOMOAPI_KEY', json);
+    if (res.status === 404) throw new ApiError(404, `fomoapi ${urlPath} -> 404`, json);
+    if (res.status === 429 || res.status >= 500) {
+      const backoff = res.status === 429 ? 30000 : 5000 * (attempt + 1);
+      log.warn(`fomoapi ${urlPath.split('?')[0]} -> ${res.status}, retrying in ${backoff / 1000}s`);
       await sleep(backoff);
       continue;
     }
-    throw new CopeError(status, `cope ${urlPath} -> ${status}`, json);
+    throw new ApiError(res.status, `fomoapi ${urlPath} -> ${res.status}`, json);
   }
-  throw new CopeError(503, `cope ${urlPath} failed after retries`, null);
-}
-
-async function ensureCopeKey() {
-  apiKey = CFG.COPE_API_KEY || kvGet('cope_api_key') || '';
-  if (apiKey) return apiKey;
-  log.info('No COPE_API_KEY set — registering a free cope.capital key');
-  const { status, json } = await queued(() =>
-    rawRequest('POST', '/v1/register', { agent_name: 'fomo-watch', description: 'Personal convergence alert bot' }, { auth: false }));
-  const key = json && (json.api_key || json.apiKey || json.key || (json.data && json.data.api_key));
-  if (status >= 300 || !key) throw new CopeError(status, 'cope.capital registration failed', json);
-  apiKey = key;
-  kvSet('cope_api_key', key);
-  log.warn(`Registered cope.capital key. Copy it into the COPE_API_KEY Railway variable: ${key}`);
-  return key;
+  throw new ApiError(503, `fomoapi ${urlPath} failed after retries`, null);
 }
 
 const qs = (params) => {
@@ -368,12 +369,11 @@ const qs = (params) => {
   return e.length ? '?' + new URLSearchParams(e.map(([k, v]) => [k, String(v)])).toString() : '';
 };
 
-const cope = {
-  leaderboard: (timeframe, limit) => copeRequest('GET', `/v1/leaderboard${qs({ timeframe, limit })}`),
-  searchTraders: (params) => copeRequest('GET', `/v1/traders/search${qs(params)}`),
-  handleStats: (handle) => copeRequest('GET', `/v1/handle/${encodeURIComponent(handle)}/stats`),
-  poll: (since) => copeRequest('GET', `/v1/activity/poll${qs({ since })}`),
-  activity: (params) => copeRequest('GET', `/v1/activity${qs(params)}`),
+const fomo = {
+  status: () => fetch(`${CFG.FOMOAPI_BASE_URL}/status`, { signal: AbortSignal.timeout(15000) }).then((r) => r.json()),
+  leaderboard: (window, limit) => apiGet(`/v2/leaderboard/${window}${qs({ limit })}`, 250),
+  positions: (handle) => apiGet(`/v2/users/${encodeURIComponent(handle)}/positions`, 250),
+  alerts: (params) => apiGet(`/v2/alerts${qs(params)}`, 125),
 };
 
 // =====================================================================================
@@ -459,36 +459,50 @@ async function tgSend(html) {
 
 // =====================================================================================
 // SECTION 7 — TRADER SELECTION ("consistent winners", refreshed daily)
-//   1. Profitable on BOTH the 7d and 30d Fomo leaderboards (or in a win-rate search AND on
-//      one of those boards). One great day isn't enough — that's the luck filter.
-//   2. Win rate >= MIN_WIN_RATE and >= MIN_TRADES closed trades when the API reports them.
-//   3. Ranked: on both boards first, then 30-day rank, then win rate. Keep TRACKED_MAX.
+//   1. Profitable on BOTH the 7d and 30d Fomo leaderboards. One great week isn't enough —
+//      that's the luck filter.
+//   2. At least MIN_TRADES trades on the 30d board (filters one-lucky-trade wallets).
+//   3. Win rate >= MIN_WIN_RATE across their most recent closed positions (checked weekly per
+//      trader; judged only when there are MIN_CLOSED_FOR_WIN_RATE+ closed positions).
+//   4. Ranked: 30-day rank, then win rate. Keep TRACKED_MAX.
 // =====================================================================================
 
-const HANDLE_KEYS = ['handle', 'username', 'fomo_handle', 'user.handle', 'user.username', 'name'];
-const PNL_KEYS = ['pnl', 'pnl_usd', 'total_pnl', 'realized_pnl', 'profit', 'pnlUsd'];
-const WIN_KEYS = ['win_rate', 'winRate', 'win_pct', 'stats.win_rate'];
-const TRADES_KEYS = ['trades', 'total_trades', 'trade_count', 'tradeCount', 'num_trades', 'closed_trades', 'stats.total_trades'];
-const RANK_KEYS = ['rank', 'position', 'place'];
+const HANDLE_KEYS = ['handle', 'username', 'user.handle', 'trader.handle'];
+const PNL_KEYS = ['pnlUsd', 'pnl_usd', 'pnl', 'realizedPnlUsd'];
+const TRADES_KEYS = ['trades', 'numTrades', 'swapCount', 'trade_count'];
+const RANK_KEYS = ['rank', 'position'];
 
 function readBoard(body) {
   const map = new Map();
-  pickArray(body).forEach((r, i) => {
+  pickArray(body, ['traders', 'data', 'items', 'results', 'leaderboard']).forEach((r, i) => {
     const h = normHandle(first(r, HANDLE_KEYS));
     if (!h) return;
     map.set(h, {
       rank: toNum(first(r, RANK_KEYS)) ?? i + 1,
       pnl: toNum(first(r, PNL_KEYS)),
-      win: toPct(first(r, WIN_KEYS)),
       trades: toNum(first(r, TRADES_KEYS)),
+      userId: first(r, ['userId', 'user_id', 'id']),
     });
   });
   return map;
 }
 
+// Win rate over the trader's recent closed positions (the endpoint returns open positions plus
+// the 25 most recent closed trades).
+function winRateFromPositions(body) {
+  const rows = pickArray(body, ['positions', 'trades', 'data', 'items', 'results']);
+  const closed = rows.filter((p) => {
+    const st = String(first(p, ['status']) || '').toLowerCase();
+    return st ? st === 'closed' : Boolean(first(p, ['closedAt', 'closed_at']));
+  });
+  const pnls = closed.map((p) => toNum(first(p, ['realizedPnlUsd', 'realized_pnl_usd', 'pnlUsd', 'pnl']))).filter((x) => x !== undefined);
+  if (!pnls.length) return { win: undefined, closedN: 0 };
+  return { win: (pnls.filter((x) => x > 0).length / pnls.length) * 100, closedN: pnls.length };
+}
+
 function passesStats(t) {
-  if (t.win !== undefined && t.win < CFG.MIN_WIN_RATE) return false;
   if (t.trades !== undefined && t.trades < CFG.MIN_TRADES) return false;
+  if (t.win !== undefined && t.closedN >= CFG.MIN_CLOSED_FOR_WIN_RATE && t.win < CFG.MIN_WIN_RATE) return false;
   return true;
 }
 
@@ -508,22 +522,36 @@ function traderInfo(handles) {
   return new Map(rows.map((r) => [r.handle, r]));
 }
 
+async function cachedWinRate(handle) {
+  const row = db.prepare('SELECT * FROM trader_stats WHERE handle = ?').get(handle);
+  if (row && Date.now() - row.checked_at < CFG.WIN_RATE_REFRESH_DAYS * D) {
+    return { win: row.win_rate ?? undefined, closedN: row.closed_n ?? 0 };
+  }
+  if (creditsLeftToday() < 1000) return row ? { win: row.win_rate ?? undefined, closedN: row.closed_n ?? 0 } : { win: undefined, closedN: 0 };
+  try {
+    const r = winRateFromPositions(await fomo.positions(handle));
+    db.prepare(`INSERT INTO trader_stats (handle, win_rate, closed_n, checked_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(handle) DO UPDATE SET win_rate = excluded.win_rate, closed_n = excluded.closed_n, checked_at = excluded.checked_at`)
+      .run(handle, r.win ?? null, r.closedN, Date.now());
+    return r;
+  } catch (e) {
+    log.debug(`positions ${handle} failed`, e.message);
+    return row ? { win: row.win_rate ?? undefined, closedN: row.closed_n ?? 0 } : { win: undefined, closedN: 0 };
+  }
+}
+
 async function refreshTraders() {
   const started = Date.now();
   let lb7 = new Map();
   let lb30 = new Map();
-  let search = new Map();
-  try { lb7 = readBoard(await cope.leaderboard('7d', CFG.LEADERBOARD_DEPTH)); } catch (e) { log.warn('7d leaderboard failed', e.message); }
-  try { lb30 = readBoard(await cope.leaderboard('30d', CFG.LEADERBOARD_DEPTH)); } catch (e) { log.warn('30d leaderboard failed', e.message); }
-  try {
-    search = readBoard(await cope.searchTraders({ min_win_rate: CFG.MIN_WIN_RATE, min_trades: CFG.MIN_TRADES, sort_by: 'pnl', limit: 100 }));
-  } catch (e) { log.warn('trader search failed', e.message); }
+  try { lb7 = readBoard(await fomo.leaderboard('7d', CFG.LEADERBOARD_DEPTH)); } catch (e) { log.warn('7d leaderboard failed', e.message); }
+  try { lb30 = readBoard(await fomo.leaderboard('30d', CFG.LEADERBOARD_DEPTH)); } catch (e) { log.warn('30d leaderboard failed', e.message); }
+  if (!lb7.size && !lb30.size) throw new Error('both leaderboards unavailable');
 
   const cands = new Map();
   const add = (h, reason) => {
     const a = lb7.get(h) || {};
     const b = lb30.get(h) || {};
-    const s = search.get(h) || {};
     cands.set(h, {
       handle: h,
       both: lb7.has(h) && lb30.has(h),
@@ -531,43 +559,31 @@ async function refreshTraders() {
       rank30: lb30.has(h) ? b.rank : undefined,
       pnl7: a.pnl,
       pnl30: b.pnl,
-      win: s.win ?? b.win ?? a.win,
-      trades: s.trades ?? b.trades ?? a.trades,
+      trades: b.trades ?? a.trades,
       reason,
     });
   };
-
   for (const h of lb7.keys()) {
     if (!lb30.has(h)) continue;
     const p7 = lb7.get(h).pnl;
     const p30 = lb30.get(h).pnl;
     if ((p7 === undefined || p7 > 0) && (p30 === undefined || p30 > 0)) add(h, 'top 7d + top 30d');
   }
-  for (const h of search.keys()) {
-    if (!cands.has(h) && (lb30.has(h) || lb7.has(h))) add(h, `win-rate search + ${lb30.has(h) ? '30d' : '7d'} board`);
-  }
-  // Fallback if the boards came back empty or in an unexpected shape: use search alone.
-  if (cands.size < 5 && search.size) {
-    log.warn(`Only ${cands.size} board-confirmed traders; falling back to win-rate search results`);
-    for (const h of search.keys()) if (!cands.has(h)) add(h, 'win-rate search (fallback)');
+  // Fallback if the boards barely overlap: take the strongest 30d names.
+  if (cands.size < 5) {
+    log.warn(`Only ${cands.size} traders on both boards; adding top 30d names`);
+    for (const [h, v] of lb30) if (!cands.has(h) && (v.pnl === undefined || v.pnl > 0)) add(h, 'top 30d (fallback)');
   }
 
-  // Fill missing win rate / trade count from the per-trader stats endpoint (free).
-  const toEnrich = [...cands.values()].sort(rankSort)
-    .filter((c) => c.win === undefined || c.trades === undefined)
-    .slice(0, Math.ceil(CFG.TRACKED_MAX * 1.5));
-  for (const c of toEnrich) {
-    try {
-      const st = await cope.handleStats(c.handle);
-      const body = st && (st.data || st.stats || st);
-      c.win = c.win ?? toPct(first(body, WIN_KEYS));
-      c.trades = c.trades ?? toNum(first(body, TRADES_KEYS));
-    } catch (e) {
-      log.debug(`stats ${c.handle} failed`, e.message);
-    }
+  // Win rates for the strongest candidates (cached weekly).
+  const ordered = [...cands.values()].filter((c) => c.trades === undefined || c.trades >= CFG.MIN_TRADES).sort(rankSort);
+  for (const c of ordered.slice(0, Math.ceil(CFG.TRACKED_MAX * 1.5))) {
+    const r = await cachedWinRate(c.handle);
+    c.win = r.win;
+    c.closedN = r.closedN;
   }
 
-  const selected = [...cands.values()].filter(passesStats).sort(rankSort).slice(0, CFG.TRACKED_MAX);
+  const selected = ordered.filter(passesStats).sort(rankSort).slice(0, CFG.TRACKED_MAX);
   if (!selected.length) {
     log.warn('Trader refresh produced 0 traders — keeping the previous list');
     return currentHandles();
@@ -585,7 +601,8 @@ async function refreshTraders() {
         pnl_7d = excluded.pnl_7d, pnl_30d = excluded.pnl_30d, rank_7d = excluded.rank_7d, rank_30d = excluded.rank_30d,
         reason = excluded.reason, updated_at = excluded.updated_at`);
     for (const c of selected) {
-      up.run(c.handle, c.win ?? null, c.trades ?? null, c.pnl7 ?? null, c.pnl30 ?? null, c.rank7 ?? null, c.rank30 ?? null, c.reason, now, now);
+      const win = c.closedN >= CFG.MIN_CLOSED_FOR_WIN_RATE ? c.win : undefined;
+      up.run(c.handle, win ?? null, c.trades ?? null, c.pnl7 ?? null, c.pnl30 ?? null, c.rank7 ?? null, c.rank30 ?? null, c.reason, now, now);
     }
     db.exec('COMMIT');
   } catch (e) {
@@ -597,7 +614,7 @@ async function refreshTraders() {
   const next = new Set(selected.map((c) => c.handle));
   const added = [...next].filter((h) => !prev.has(h)).length;
   const dropped = [...prev].filter((h) => !next.has(h)).length;
-  log.info(`Following ${selected.length} traders (boards: 7d=${lb7.size}, 30d=${lb30.size}, search=${search.size}; +${added} −${dropped}) in ${Math.round((Date.now() - started) / 1000)}s`);
+  log.info(`Following ${selected.length} traders (7d board ${lb7.size}, 30d board ${lb30.size}; +${added} −${dropped}) in ${Math.round((Date.now() - started) / 1000)}s · credits used today ${creditsUsed()}`);
   return [...next];
 }
 
@@ -724,83 +741,152 @@ function weeklyMessage(r) {
 }
 
 // =====================================================================================
-// SECTION 9 — WATCHER (reads followed traders' buys, detects agreement, sends alerts)
+// SECTION 9 — WATCHER (live buy feed → followed traders' buys → agreement → alert)
+// Buys arrive over fomoapi.io's WebSocket feed as they happen. After a disconnect or restart
+// it catches up once over REST, so nothing inside the 4h window is missed.
 // =====================================================================================
 
-let lastFetchAt = 0;
+const CHAIN_IDS = { 1399811149: 'solana', 4663: 'robinhood', 8453: 'base', 1: 'ethereum', 56: 'bsc' };
+
+let trackedCache = { at: 0, set: new Set() };
+function trackedSet() {
+  if (Date.now() - trackedCache.at > MIN) trackedCache = { at: Date.now(), set: new Set(currentHandles()) };
+  return trackedCache.set;
+}
 
 function parseBuy(r) {
+  const chainId = toNum(first(r, ['chainId', 'chain_id', 'networkId']));
+  const tokenObj = r && typeof r.token === 'object' ? r.token : null;
   return {
-    action: String(first(r, ['action', 'side', 'type', 'direction']) || '').toLowerCase(),
-    ts: toMs(first(r, ['timestamp', 'ts', 'block_time', 'blockTime', 'created_at', 'time', 'executed_at'])),
-    handle: normHandle(first(r, ['handle', 'username', 'fomo_handle', 'trader', 'user.handle'])),
-    chain: String(first(r, ['chain', 'network', 'chain_id']) || 'solana').toLowerCase(),
-    mint: String(first(r, ['token_mint', 'mint', 'token_address', 'tokenAddress', 'token.mint', 'token.address', 'address']) || ''),
-    symbol: first(r, ['token_symbol', 'symbol', 'token.symbol', 'ticker']),
-    usd: toNum(first(r, ['usd_amount', 'usd', 'amount_usd', 'usdAmount', 'value_usd', 'volume_usd'])),
-    tx: first(r, ['signature', 'tx_hash', 'txHash', 'tx', 'txid', 'transaction', 'id']),
+    action: String(first(r, ['alertType', 'side', 'action', 'kind']) || '').toLowerCase(),
+    ts: toMs(first(r, ['execTs', 'ts', 'timestamp', 'blockTs', 'createdAt', 'time'])),
+    handle: normHandle(first(r, ['trader.handle', 'handle', 'username']) ?? (typeof r.trader === 'string' ? r.trader : undefined)),
+    chain: String(first(r, ['chain', 'network']) || CHAIN_IDS[chainId] || 'solana').toLowerCase(),
+    mint: String(first(r, ['tokenAddress', 'token_address', 'token.address', 'mint', 'token_mint']) || ''),
+    symbol: tokenObj ? first(tokenObj, ['symbol', 'ticker']) : (typeof r.token === 'string' ? r.token : first(r, ['symbol', 'token_symbol'])),
+    // The feed's usdValue isn't always the fill size; prefer tradeUsd when present.
+    usd: toNum(first(r, ['tradeUsd', 'usdValue', 'usd', 'usd_amount'])),
+    id: first(r, ['eventId', 'txHash', 'tradeId', 'id']),
   };
 }
 
-// Spread the day's counted calls evenly until 00:00 UTC.
-function fetchGapMs(now = Date.now()) {
-  const left = budgetLeft() - 5; // keep a few for the daily trader refresh
-  if (left <= 0) return Infinity;
-  return Math.max(MIN, msUntilUtcMidnight(now) / left);
+// Store one buy if it's from a followed trader and passes the filters. Returns true if new.
+function ingestBuy(raw) {
+  const b = parseBuy(raw);
+  if (b.ts && b.ts > Number(kvGet('last_buy_seen_ts') || 0)) kvSet('last_buy_seen_ts', Math.min(b.ts, Date.now()));
+  if (b.action && !['buy', 'bought', 'swap_in', 'whale'].includes(b.action)) return false;
+  if (!b.handle || !trackedSet().has(b.handle) || !b.mint) return false;
+  const ts = b.ts || Date.now();
+  if (ts < Date.now() - CFG.WINDOW_HOURS * H) return false;
+  if (b.usd !== undefined && b.usd < CFG.MIN_BUY_USD) return false;
+  if (b.symbol && CFG.EXCLUDE_SYMBOLS.includes(String(b.symbol).toUpperCase())) return false;
+  const id = b.id ? `${b.id}:${b.handle}:${b.mint}` : `${b.handle}:${b.mint}:${ts}:${b.usd}`;
+  const res = db.prepare('INSERT OR IGNORE INTO buys (id, ts, handle, chain, mint, symbol, usd) VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run(id, ts, b.handle, b.chain, b.mint, b.symbol ?? null, b.usd ?? null);
+  if (res.changes) log.info(`buy: @${b.handle} ${b.symbol || b.mint.slice(0, 6)} ${fmtUsd(b.usd)} (${b.chain})`);
+  return Boolean(res.changes);
 }
 
-async function watchTick() {
-  const tracked = new Set(currentHandles());
-  if (!tracked.size) { log.warn('No traders followed yet; skipping activity'); return; }
+// Run detection shortly after new buys, batching bursts.
+let detectTimer = null;
+function scheduleDetect() {
+  if (detectTimer) return;
+  detectTimer = setTimeout(() => {
+    detectTimer = null;
+    detect().catch((e) => log.error('detect failed', e.message));
+  }, 5000);
+}
 
-  const lastTs = Number(kvGet('last_activity_ts') || 0);
-  const sinceMs = Math.max(Date.now() - CFG.WINDOW_HOURS * H, lastTs - CFG.ACTIVITY_OVERLAP_SECONDS * 1000);
-  const sinceSec = Math.floor(sinceMs / 1000);
-
-  // Free poll first: only spend a counted call when something has happened.
-  try {
-    const p = await cope.poll(sinceSec);
-    if (toNum(first(p, ['count', 'new', 'total', 'data.count'])) === 0) { log.debug('poll: nothing new'); return; }
-  } catch (e) {
-    if (e.status === 401) throw e;
-    log.debug('poll failed, falling through to activity', e.message);
-  }
-
-  const gap = fetchGapMs();
-  if (Date.now() - lastFetchAt < gap) { log.debug('budget pacing: waiting'); return; }
-
+// REST catch-up for anything missed while the feed was down (or before a restart).
+async function backfill() {
+  const key = `backfills:${utcDay()}`;
+  const done = Number(kvGet(key) || 0);
+  if (done >= CFG.BACKFILL_MAX_PER_DAY) { log.debug('backfill limit reached today'); return 0; }
+  const floor = Date.now() - CFG.WINDOW_HOURS * H;
+  const since = Math.max(floor, Number(kvGet('last_buy_seen_ts') || 0) - 5 * MIN);
+  kvSet(key, done + 1);
   let body;
   try {
-    lastFetchAt = Date.now();
-    body = await cope.activity({ since: sinceSec, action: 'buy', min_usd: CFG.MIN_BUY_USD, limit: CFG.ACTIVITY_LIMIT });
+    body = await fomo.alerts({ type: 'buy', since: Math.floor(since / 1000), limit: 100 });
   } catch (e) {
-    if (e.status === 402) { log.info('Daily free calls used; waiting for 00:00 UTC reset'); return; }
-    throw e;
+    log.warn('backfill failed', e.message);
+    return 0;
   }
+  let n = 0;
+  for (const r of pickArray(body, ['alerts', 'data', 'items', 'results', 'events'])) if (ingestBuy(r)) n++;
+  log.info(`backfill: ${n} missed followed buys recovered`);
+  if (n) await detect();
+  return n;
+}
 
-  const rows = pickArray(body);
-  const saturated = rows.length >= CFG.ACTIVITY_LIMIT ? 1 : 0;
-  db.prepare("UPDATE fetch_log SET rows = ?, saturated = ? WHERE rowid = (SELECT MAX(rowid) FROM fetch_log WHERE endpoint = '/v1/activity')")
-    .run(rows.length, saturated);
-  if (saturated) log.warn(`activity returned the full limit (${rows.length}); some buys in this window may be missing`);
+// --- Live feed ---
+const feed = { ws: null, lastMsgAt: 0, attempts: 0, connectedOnce: false, stopped: false, everConnected: false };
 
-  const ins = db.prepare('INSERT OR IGNORE INTO buys (id, ts, handle, chain, mint, symbol, usd) VALUES (?, ?, ?, ?, ?, ?, ?)');
-  let maxTs = lastTs;
-  let kept = 0;
-  for (const r of rows) {
-    const b = parseBuy(r);
-    if (b.ts && b.ts > maxTs) maxTs = b.ts;
-    if (b.action && !['buy', 'swap_in', 'bought'].includes(b.action)) continue;
-    if (!b.handle || !tracked.has(b.handle) || !b.mint || !b.ts) continue;
-    if (b.usd !== undefined && b.usd < CFG.MIN_BUY_USD) continue;
-    if (b.symbol && CFG.EXCLUDE_SYMBOLS.includes(String(b.symbol).toUpperCase())) continue;
-    const id = b.tx ? `${b.tx}:${b.handle}:${b.mint}` : `${b.handle}:${b.mint}:${b.ts}:${b.usd}`;
-    kept += Number(ins.run(id, b.ts, b.handle, b.chain, b.mint, b.symbol ?? null, b.usd ?? null).changes || 0);
+function connectFeed() {
+  if (feed.stopped || !CFG.FOMOAPI_KEY) return;
+  const url = `${CFG.FOMOAPI_WS_URL}?${new URLSearchParams({ key: CFG.FOMOAPI_KEY, type: 'buy' })}`;
+  let ws;
+  try {
+    ws = new WebSocket(url);
+  } catch (e) {
+    log.error('feed: could not open WebSocket', e.message);
+    return reconnectLater();
   }
-  if (maxTs > lastTs) kvSet('last_activity_ts', Math.min(maxTs, Date.now()));
-  log.info(`activity: ${rows.length} rows, ${kept} new followed buys · budget left ${budgetLeft()}`);
+  feed.ws = ws;
+  feed.lastMsgAt = Date.now();
 
-  await detect();
+  ws.addEventListener('open', () => {
+    const wasDown = feed.connectedOnce;
+    feed.connectedOnce = true;
+    feed.everConnected = true;
+    feed.attempts = 0;
+    log.info(wasDown ? 'feed: reconnected' : 'feed: connected to live buy feed');
+    backfill().catch(() => {});
+  });
+
+  ws.addEventListener('message', (ev) => {
+    feed.lastMsgAt = Date.now();
+    let msg;
+    try { msg = JSON.parse(typeof ev.data === 'string' ? ev.data : Buffer.from(ev.data).toString()); } catch { return; }
+    const items = Array.isArray(msg) ? msg : [msg];
+    let fresh = false;
+    for (const m of items) {
+      const kind = String(m.type || m.event || '').toLowerCase();
+      if (kind === 'welcome' || kind === 'subscribed' || kind === 'ping' || kind === 'pong') { log.debug(`feed: ${kind}`); continue; }
+      if (kind === 'error') { log.warn('feed error message', JSON.stringify(m).slice(0, 300)); continue; }
+      const payload = m.alert || m.data || m;
+      if (ingestBuy(payload)) fresh = true;
+    }
+    if (fresh) scheduleDetect();
+  });
+
+  ws.addEventListener('close', (ev) => {
+    if (feed.ws !== ws) return;
+    feed.ws = null;
+    log.warn(`feed: closed (${ev.code}${ev.reason ? ' ' + ev.reason : ''})`);
+    if (ev.code === 4001 || ev.code === 4003 || ev.code === 1008) log.error('feed: key refused — check FOMOAPI_KEY');
+    reconnectLater();
+  });
+
+  ws.addEventListener('error', (ev) => {
+    log.warn('feed: socket error', (ev && ev.message) || '');
+  });
+}
+
+function reconnectLater() {
+  if (feed.stopped) return;
+  feed.attempts++;
+  const delay = Math.min(5 * MIN, 5000 * 2 ** Math.min(feed.attempts - 1, 6));
+  setTimeout(connectFeed, delay);
+}
+
+// Reconnect if the feed has gone silent (a half-open socket can look connected).
+function feedWatchdog() {
+  if (!feed.ws) return;
+  if (Date.now() - feed.lastMsgAt > CFG.WS_SILENCE_RECONNECT_SECONDS * 1000) {
+    log.warn('feed: no messages for a while — reconnecting');
+    try { feed.ws.close(); } catch {}
+  }
 }
 
 async function detect(now = Date.now()) {
@@ -978,7 +1064,7 @@ function buildReport(now = Date.now()) {
 }
 
 // =====================================================================================
-// SECTION 12 — SCHEDULER (startup is silent on Telegram)
+// SECTION 12 — SCHEDULER (startup is silent on Telegram; problems are logged and retried, never crash)
 // =====================================================================================
 
 function londonNow(t = Date.now()) {
@@ -995,7 +1081,7 @@ function every(name, ms, fn, { immediate = true } = {}) {
     running = true;
     try { await fn(); } catch (e) {
       log.error(`${name} failed: ${e.message}`);
-      if (e.status === 401) log.error('Fix COPE_API_KEY in Railway variables, then redeploy.');
+      if (e.status === 401) log.error('Fix FOMOAPI_KEY in Railway variables, then redeploy.');
     } finally { running = false; }
   };
   if (immediate) run();
@@ -1004,8 +1090,11 @@ function every(name, ms, fn, { immediate = true } = {}) {
 
 async function maybeRefreshTraders() {
   const last = Number(kvGet('traders_refreshed_at') || 0);
-  if (Date.now() - last < CFG.REFRESH_TRADERS_HOURS * H && currentHandles().length) return;
+  const have = currentHandles().length;
+  // Retry every 30 min until a first list exists; then once per REFRESH_TRADERS_HOURS.
+  if (have && Date.now() - last < CFG.REFRESH_TRADERS_HOURS * H) return;
   await refreshTraders();
+  trackedCache.at = 0;
 }
 
 async function maybeWeekly() {
@@ -1021,20 +1110,35 @@ async function maybeHousekeeping() {
   const today = new Date().toISOString().slice(0, 10);
   if (kvGet('pruned_on') === today) return;
   kvSet('pruned_on', today);
+  log.info(`daily: credits used yesterday ${kvGet(`credits:${utcDay(Date.now() - D)}`) || 0} · month remaining ${kvGet('credits_remaining') ?? '?'}`);
   prune();
 }
 
 async function main() {
   dbOpen();
-  await ensureCopeKey();
-  log.info(`fomo-watch started · mode ${CFG.MODE} · trigger ${CFG.MIN_TRADERS}+ traders in ${CFG.WINDOW_HOURS}h · budget left today ${budgetLeft()}`);
-  if (!CFG.TELEGRAM_BOT_TOKEN || !CFG.TELEGRAM_CHANNEL_ID) log.warn('TELEGRAM_BOT_TOKEN / TELEGRAM_CHANNEL_ID not set — alerts will only be logged');
+  log.info(`fomo-watch v2 started · mode ${CFG.MODE} · trigger ${CFG.MIN_TRADERS}+ traders in ${CFG.WINDOW_HOURS}h`);
+  if (!CFG.TELEGRAM_BOT_TOKEN || !CFG.TELEGRAM_CHANNEL_ID) log.warn('Telegram variables not set — alerts will only be logged');
 
-  await maybeRefreshTraders().catch((e) => log.error('initial trader refresh failed', e.message));
+  if (!CFG.FOMOAPI_KEY) {
+    // Stay up (no crash loop) and keep saying what's needed.
+    const say = () => log.error('FOMOAPI_KEY is not set. Get a free key at fomoapi.io/dashboard and add it as a Railway variable on this service.');
+    say();
+    setInterval(say, 10 * MIN);
+    return;
+  }
 
-  every('traders', 30 * MIN, maybeRefreshTraders, { immediate: false });
-  every('activity', CFG.POLL_SECONDS * 1000, watchTick);
+  try {
+    const st = await fomo.status();
+    log.info(`fomoapi.io status: ${first(st, ['status']) || JSON.stringify(st).slice(0, 120)}`);
+  } catch (e) {
+    log.warn(`fomoapi.io status check failed: ${netReason(e)} — will keep retrying`);
+  }
+
+  every('traders', 30 * MIN, maybeRefreshTraders);
+  connectFeed();
+  setInterval(feedWatchdog, MIN);
   every('outcomes', CFG.OUTCOME_CHECK_MINUTES * MIN, () => checkOutcomes());
+  every('detect', 5 * MIN, () => detect(), { immediate: false }); // safety net alongside the live trigger
   every('weekly', 10 * MIN, maybeWeekly);
   every('housekeeping', 60 * MIN, maybeHousekeeping);
 }
@@ -1045,25 +1149,46 @@ async function main() {
 
 async function probe() {
   dbOpen();
-  await ensureCopeKey();
-  const shape = (label, body) => {
-    const rows = pickArray(body);
+  if (!CFG.FOMOAPI_KEY) throw new Error('FOMOAPI_KEY is not set');
+  const shape = (label, body, keys) => {
+    const rows = pickArray(body, keys);
     console.log(`\n=== ${label} ===`);
     console.log(`top-level: ${Array.isArray(body) ? 'array' : Object.keys(body || {}).join(', ')}`);
     console.log(`rows: ${rows.length}`);
     console.log('first row:', JSON.stringify(rows[0] ?? body, null, 2).slice(0, 1500));
+    return rows;
   };
-  const hourAgo = Math.floor(Date.now() / 1000) - 3600;
-  shape('leaderboard 7d', await cope.leaderboard('7d', 5));
-  shape('traders/search', await cope.searchTraders({ min_win_rate: 55, min_trades: 20, sort_by: 'pnl', limit: 5 }));
-  console.log('\n=== activity/poll ===\n', JSON.stringify(await cope.poll(hourAgo)));
-  shape('activity (buys, last hour)', await cope.activity({ since: hourAgo, action: 'buy', limit: 5 }));
-  console.log(`\nCounted calls left today: ${budgetLeft()}`);
+  try { console.log('\n=== status ===\n', JSON.stringify(await fomo.status()).slice(0, 400)); } catch (e) { console.log('status failed:', netReason(e)); }
+  const board = readBoard(await fomo.leaderboard('7d', 3));
+  shape('leaderboard 7d', await fomo.leaderboard('30d', 3), ['traders']);
+  const top = [...board.keys()][0];
+  if (top) {
+    const pos = await fomo.positions(top);
+    shape(`positions @${top}`, pos, ['positions', 'trades']);
+    console.log('computed win rate:', JSON.stringify(winRateFromPositions(pos)));
+  }
+  console.log('\n=== live feed (listening 60s, first 3 messages) ===');
+  await new Promise((resolve) => {
+    let n = 0;
+    const ws = new WebSocket(`${CFG.FOMOAPI_WS_URL}?${new URLSearchParams({ key: CFG.FOMOAPI_KEY, type: 'buy' })}`);
+    const done = () => { try { ws.close(); } catch {} resolve(); };
+    ws.addEventListener('open', () => console.log('connected'));
+    ws.addEventListener('message', (ev) => {
+      console.log(String(ev.data).slice(0, 1200));
+      const parsed = (() => { try { return JSON.parse(ev.data); } catch { return null; } })();
+      if (parsed && parsed.type === 'alert') console.log('parsed as:', JSON.stringify(parseBuy(parsed.alert || parsed.data || parsed)));
+      if (++n >= 3) done();
+    });
+    ws.addEventListener('close', (ev) => { console.log(`closed ${ev.code} ${ev.reason || ''}`); resolve(); });
+    ws.addEventListener('error', () => console.log('socket error'));
+    setTimeout(done, 60000);
+  });
+  console.log(`\nCredits used today: ${creditsUsed()} · month remaining: ${kvGet('credits_remaining') ?? '?'}`);
 }
 
 if (require.main === module) {
   const cmd = process.argv[2];
-  for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { log.info(`${sig} — shutting down`); dbClose(); process.exit(0); });
+  for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { log.info(`${sig} — shutting down`); feed.stopped = true; dbClose(); process.exit(0); });
   process.on('unhandledRejection', (e) => log.error('unhandled rejection', e && e.message));
 
   if (cmd === 'probe') {
@@ -1075,13 +1200,17 @@ if (require.main === module) {
     dbOpen();
     console.log(weeklyMessage(buildReport()).replace(/<[^>]+>/g, ''));
   } else {
-    main().catch((e) => { log.error('fatal', e.message); process.exit(1); });
+    // Never exit on a startup error: log it and keep the process alive so Railway doesn't crash-loop.
+    main().catch((e) => {
+      log.error(`startup problem: ${e.message} — retrying in 5 minutes`);
+      setTimeout(() => main().catch((err) => log.error('startup retry failed', err.message)), 5 * MIN);
+    });
   }
 }
 
 // Exported for the offline test.
 module.exports = {
-  dbOpen, kvGet, kvSet, get db() { return db; }, ensureCopeKey, refreshTraders, watchTick, detect, fetchGapMs,
-  checkOutcomes, prune, buildReport, weeklyMessage, toMs, toPct,
-  _resetPacing: () => { lastFetchAt = 0; },
+  dbOpen, kvGet, kvSet, get db() { return db; }, refreshTraders, ingestBuy, backfill, detect, connectFeed, feed,
+  checkOutcomes, prune, buildReport, weeklyMessage, toMs, toPct, winRateFromPositions, parseBuy,
+  _resetTracked: () => { trackedCache.at = 0; },
 };
