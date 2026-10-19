@@ -1,5 +1,5 @@
 // =====================================================================================
-// portfolio-bot-v8.js — fomo-watch v2 🏹 (data from fomoapi.io; temporarily replacing Hunter — Hunter backup: portfolio-bot-v8-hunter-backup.js)
+// portfolio-bot-v8.js — fomo-watch v2 🏹 (data from fomoapi.io, alerts to Discord; temporarily replacing Hunter — Hunter backup: portfolio-bot-v8-hunter-backup.js)
 // Follows consistently profitable Fomo traders and alerts the private Telegram channel
 // when 3+ of them buy the same token within 4 hours. Observation mode tracks every
 // alert's outcome for 7 days and sends a weekly evidence report (Sunday ~18:00 UK).
@@ -55,6 +55,9 @@ const CFG = {
   // Falls back to Hunter's variable names, so it runs in the Sniper-bot service with no new Telegram variables.
   TELEGRAM_BOT_TOKEN: str('TELEGRAM_BOT_TOKEN', str('BOT_TOKEN', '')),
   TELEGRAM_CHANNEL_ID: str('TELEGRAM_CHANNEL_ID', str('CHANNEL_CHAT_ID', '')), // private channel, e.g. -100xxxxxxxxxx
+  // Discord: when set, alerts go here instead of Telegram (ALSO_TELEGRAM=1 posts to both).
+  DISCORD_WEBHOOK_URL: str('DISCORD_WEBHOOK_URL', ''),
+  ALSO_TELEGRAM: bool('ALSO_TELEGRAM', false),
   DB_PATH: str('DB_PATH', '/data/fomo-watch.db'),       // Railway volume mounted at /data
   DEXSCREENER_BASE_URL: str('DEXSCREENER_BASE_URL', 'https://api.dexscreener.com'),
 
@@ -425,10 +428,88 @@ async function getPrices(chain, mints) {
 const getPrice = async (chain, mint) => (await getPrices(chain, [mint])).get(mint);
 
 // =====================================================================================
-// SECTION 6 — TELEGRAM
+// SECTION 6 — OUTPUT: DISCORD (preferred) or TELEGRAM
+// Messages are written once as Telegram-style HTML. When DISCORD_WEBHOOK_URL is set they go to
+// Discord only (converted to Discord markdown); set ALSO_TELEGRAM=1 to post to both.
 // =====================================================================================
 
 async function tgSend(html) {
+  if (!CFG.DISCORD_WEBHOOK_URL) return telegramSend(html);
+  const ok = await discordSend(html);
+  if (CFG.ALSO_TELEGRAM) await telegramSend(html);
+  return ok;
+}
+
+// Telegram HTML -> Discord markdown. Text is escaped so handles like @some_trader don't turn italic.
+function htmlToDiscord(html) {
+  const unent = (s) => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&');
+  const escMd = (s) => unent(s).replace(/([\\*_~`|])/g, '\\$1');
+  let out = '';
+  let inCode = false;
+  const re = /<(\/?)(b|i|code|a)(?:\s+href="([^"]*)")?>|<[^>]+>/g;
+  let last = 0;
+  let linkHref = null;
+  let m;
+  while ((m = re.exec(html))) {
+    const text = html.slice(last, m.index);
+    out += inCode ? unent(text) : escMd(text);
+    last = re.lastIndex;
+    const [, close, tag, href] = m;
+    if (!tag) continue; // unknown tag: drop it
+    if (tag === 'b') out += '**';
+    else if (tag === 'i') out += '*';
+    else if (tag === 'code') { out += '`'; inCode = !close; }
+    else if (tag === 'a') {
+      if (!close) { linkHref = unent(href || ''); out += '['; }
+      else { out += linkHref ? `](<${linkHref}>)` : ']'; linkHref = null; }
+    }
+  }
+  out += inCode ? unent(html.slice(last)) : escMd(html.slice(last));
+  return out;
+}
+
+// Split on line breaks so no piece exceeds Discord's 2,000-character limit.
+function splitForDiscord(text, max = 1900) {
+  const parts = [];
+  let cur = '';
+  for (const line of text.split('\n')) {
+    if (cur && cur.length + line.length + 1 > max) { parts.push(cur); cur = ''; }
+    cur = cur ? `${cur}\n${line}` : line.slice(0, max);
+  }
+  if (cur) parts.push(cur);
+  return parts;
+}
+
+async function discordSend(html) {
+  let allOk = true;
+  for (const content of splitForDiscord(htmlToDiscord(html))) {
+    let ok = false;
+    for (let attempt = 0; attempt < 3 && !ok; attempt++) {
+      try {
+        const res = await fetch(CFG.DISCORD_WEBHOOK_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          // No pings, no link previews.
+          body: JSON.stringify({ content, allowed_mentions: { parse: [] }, flags: 4 }),
+          signal: AbortSignal.timeout(15000),
+        });
+        if (res.ok) { ok = true; break; }
+        const body = await res.json().catch(() => ({}));
+        if (res.status === 429) { await sleep(Math.ceil((body.retry_after || 2) * 1000)); continue; }
+        log.error(`Discord ${res.status}`, body.message || '');
+        if (res.status === 401 || res.status === 404) log.error('Discord webhook rejected — check DISCORD_WEBHOOK_URL');
+        break;
+      } catch (e) {
+        log.warn('Discord send failed', e.message);
+        await sleep(3000);
+      }
+    }
+    if (!ok) allOk = false;
+  }
+  return allOk;
+}
+
+async function telegramSend(html) {
   if (!CFG.TELEGRAM_BOT_TOKEN || !CFG.TELEGRAM_CHANNEL_ID) {
     log.warn('Telegram not configured — message only logged:\n' + html.replace(/<[^>]+>/g, ''));
     return false;
@@ -1117,7 +1198,9 @@ async function maybeHousekeeping() {
 async function main() {
   dbOpen();
   log.info(`fomo-watch v2 started · mode ${CFG.MODE} · trigger ${CFG.MIN_TRADERS}+ traders in ${CFG.WINDOW_HOURS}h`);
-  if (!CFG.TELEGRAM_BOT_TOKEN || !CFG.TELEGRAM_CHANNEL_ID) log.warn('Telegram variables not set — alerts will only be logged');
+  if (CFG.DISCORD_WEBHOOK_URL) log.info(`alerts → Discord${CFG.ALSO_TELEGRAM ? ' + Telegram' : ''}`);
+  else if (CFG.TELEGRAM_BOT_TOKEN && CFG.TELEGRAM_CHANNEL_ID) log.info('alerts → Telegram');
+  else log.warn('No Discord webhook or Telegram variables set — alerts will only be logged');
 
   if (!CFG.FOMOAPI_KEY) {
     // Stay up (no crash loop) and keep saying what's needed.
@@ -1211,6 +1294,6 @@ if (require.main === module) {
 // Exported for the offline test.
 module.exports = {
   dbOpen, kvGet, kvSet, get db() { return db; }, refreshTraders, ingestBuy, backfill, detect, connectFeed, feed,
-  checkOutcomes, prune, buildReport, weeklyMessage, toMs, toPct, winRateFromPositions, parseBuy,
+  checkOutcomes, prune, buildReport, weeklyMessage, toMs, toPct, winRateFromPositions, parseBuy, htmlToDiscord, splitForDiscord,
   _resetTracked: () => { trackedCache.at = 0; },
 };

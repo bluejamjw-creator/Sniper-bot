@@ -155,6 +155,21 @@ const DISCORD_WEBHOOK_SIGNALS  = process.env.DISCORD_WEBHOOK_SIGNALS  || "";
 const DISCORD_WEBHOOK_INTEL    = process.env.DISCORD_WEBHOOK_INTEL    || "";
 const DISCORD_WEBHOOK_WATCHLIST = process.env.DISCORD_WEBHOOK_WATCHLIST || "";
 const DISCORD_WEBHOOK_PREMIUM   = process.env.DISCORD_WEBHOOK_PREMIUM   || "";
+// Personal-use routing (one webhook per Discord channel):
+//   SIGNALS -> buy signals, order-cancelled notices, sell/close results
+//   PICKS   -> portfolio picks, weekly review, quiet grinders
+//   INTEL   -> routine intel/briefings (only when ROUTINE_ALERTS=1)
+//   STATUS  -> bot problems and one-off test results
+// Set TELEGRAM_ALERTS=0 once Discord is working to stop Telegram. A message kind with no Discord webhook still
+// falls back to Telegram, so nothing is silently dropped.
+const DISCORD_WEBHOOK_PICKS  = process.env.DISCORD_WEBHOOK_PICKS  || "";
+const DISCORD_WEBHOOK_STATUS = process.env.DISCORD_WEBHOOK_STATUS || "";
+const TELEGRAM_ALERTS = process.env.TELEGRAM_ALERTS !== "0";
+function discordHookFor(kind) {
+  if (!DISCORD_ENABLED) return "";
+  return ({ signals: DISCORD_WEBHOOK_SIGNALS, picks: DISCORD_WEBHOOK_PICKS, intel: DISCORD_WEBHOOK_INTEL, status: DISCORD_WEBHOOK_STATUS }[kind]) || "";
+}
+function telegramWanted(kind) { return TELEGRAM_ALERTS || !discordHookFor(kind); }
 const TWELVE_DATA_API_KEY   = process.env.TWELVE_DATA_API_KEY   || "";
 const ALPHA_VANTAGE_API_KEY = process.env.ALPHA_VANTAGE_API_KEY || "";
 const FINNHUB_API_KEY       = process.env.FINNHUB_API_KEY       || "";
@@ -1650,8 +1665,14 @@ function alertsChatId() { return ALERTS_TO === "dm" ? CHAT_ID : (CHANNEL_ID || C
 // Core alerts always send: buy signal, cancel notices, close/sell, picks, bot problems.
 // Set ROUTINE_ALERTS=1 in Railway to bring the routine ones back.
 const ROUTINE_ALERTS = process.env.ROUTINE_ALERTS === "1";
-async function routineSend(msg) { if (ROUTINE_ALERTS) await sendPrivate(msg); }
-async function sendPrivate(msg) {
+async function routineSend(msg) { if (ROUTINE_ALERTS) await sendPrivate(msg, "intel"); }
+// kind: "signals" | "picks" | "intel" | "status" -- decides which Discord channel (and whether Telegram) gets it.
+async function sendPrivate(msg, kind = "status") {
+  const hook = discordHookFor(kind);
+  if (hook) await sendDiscord(hook, msg);
+  if (telegramWanted(kind)) await telegramPrivate(msg);
+}
+async function telegramPrivate(msg) {
   msg = ensureDisclaimer(msg);
   const target = alertsChatId();
   if (!BOT_TOKEN || !target) { log(msg); return; }
@@ -1676,7 +1697,8 @@ function ensureDisclaimer(msg) {
   return body + "\n\n" + SIGNOFF;
 }
 
-async function sendChannel(msg) {
+async function sendChannel(msg, kind = "signals") {
+  if (!telegramWanted(kind)) return;
   if (!BOT_TOKEN || !CHANNEL_ID) return; // silently skip if no channel configured
   try {
     await retry(() => axios.post(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
@@ -1700,19 +1722,39 @@ async function sendDiscord(webhookUrl, msg) {
   if (!DISCORD_ENABLED) return; // Discord disabled
   if (!webhookUrl) return; // not configured yet -- safe no-op
   try {
-    const content = telegramHtmlToDiscordMarkdown(ensureDisclaimer(msg)).slice(0, 1990); // Discord's 2000-char cap
-    await retry(() => axios.post(webhookUrl, { content }, { timeout: 10000 }));
+    const text = telegramHtmlToDiscordMarkdown(ensureDisclaimer(msg))
+      .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, "&");
+    // Discord caps a message at 2000 chars: split on line breaks instead of cutting the end off
+    const chunks = [];
+    let cur = "";
+    for (const line of text.split("\n")) {
+      if (cur.length + line.length + 1 > 1900) { if (cur) chunks.push(cur); cur = ""; }
+      cur += (cur ? "\n" : "") + line.slice(0, 1900);
+    }
+    if (cur) chunks.push(cur);
+    for (const content of chunks) {
+      try {
+        await axios.post(webhookUrl, { content, allowed_mentions: { parse: [] } }, { timeout: 10000 });
+      } catch (e) {
+        if (e?.response?.status === 429) { // rate limited: wait as told, then retry once
+          const wait = Math.min(10, (e.response.data?.retry_after || 2)) * 1000;
+          await sleep(wait);
+          await axios.post(webhookUrl, { content, allowed_mentions: { parse: [] } }, { timeout: 10000 });
+        } else throw e;
+      }
+      if (chunks.length > 1) await sleep(400);
+    }
   } catch (e) { log(`DISCORD ERROR: ${e.message}`); }
 }
 
 async function sendSignalsChannels(msg) {
-  await sendChannel(msg);
+  await sendChannel(msg, "signals");
   await sendDiscord(DISCORD_WEBHOOK_SIGNALS, msg);
 }
 
 async function sendIntelChannels(msg) {
   if (!ROUTINE_ALERTS) return; // narrative/briefing posts are OFF; discovery logging still runs
-  await sendChannel(msg);
+  await sendChannel(msg, "intel");
   await sendDiscord(DISCORD_WEBHOOK_INTEL, msg);
 }
 
@@ -1722,7 +1764,7 @@ async function sendIntelChannels(msg) {
 // separate channel avoids it reading as a confirmed trade.
 async function sendWatchlistChannels(msg) {
   if (!ROUTINE_ALERTS) return;
-  await sendChannel(msg);
+  await sendChannel(msg, "intel");
   await sendDiscord(DISCORD_WEBHOOK_WATCHLIST, msg);
 }
 
@@ -1734,11 +1776,14 @@ async function sendPremiumChannel(msg) {
 }
 
 // Convenience -- sends to BOTH private and channel
-async function sendBoth(msg) {
-  if (ALERTS_TO !== "dm" && CHANNEL_ID) { await sendPrivate(msg); return; } // already goes to the channel -- don't post twice
-  await sendPrivate(msg);
+async function sendBoth(msg, kind = "picks") {
+  const hook = discordHookFor(kind);
+  if (hook) await sendDiscord(hook, msg);
+  if (!telegramWanted(kind)) return;
+  if (ALERTS_TO !== "dm" && CHANNEL_ID) { await telegramPrivate(msg); return; } // already goes to the channel -- don't post twice
+  await telegramPrivate(msg);
   await sleep(300);
-  await sendChannel(msg);
+  await sendChannel(msg, kind);
 }
 
 // ── ATR ──────────────────────────────────────────────────────────
@@ -4209,6 +4254,7 @@ async function postLeaderboardEvent(event) {
 // entry/exit), not trading-critical, so a 5-min throttle costs nothing
 // real while cutting this call volume by ~10x.
 let lastLeaderboardCheckAt = 0;
+let lastGrindShadowCheck = 0;
 const LEADERBOARD_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 async function runMomentumLeaderboardCheck() {
   if (Date.now() - lastLeaderboardCheckAt < LEADERBOARD_CHECK_INTERVAL_MS) return;
@@ -4248,7 +4294,8 @@ async function pruneOldData() {
   const cutoffIso = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
   const tables = [
     { name: "grind_diagnostics", col: "created_at" },
-    { name: "sniper_signal_decisions", col: "created_at" }
+    { name: "sniper_signal_decisions", col: "created_at" },
+    { name: "grind_volume_shadow", col: "created_at" }
   ];
   for (const t of tables) {
     try {
@@ -4259,6 +4306,73 @@ async function pruneOldData() {
       else log(`🧹 Pruned ${t.name}: ${count ?? "?"} rows older than 30 days`);
     } catch (e) { log(`⚠️ Prune ${t.name} failed: ${e.message}`); }
   }
+}
+
+// ══ Grind volume shadow test ═════════════════════════════════════
+// Grind/override candidates that die ONLY on volume are recorded (crypto), split into a near-miss band
+// (0.9x to the required level) and a low-volume baseline (<0.9x). Price is checked ~4h and ~24h later.
+// Nothing here changes any gate -- it answers "does volume near 1.0x predict anything?" before we touch a threshold.
+const GRIND_SHADOW_LAST = new Map();
+function grindShadowRecord({ asset, market, path, vol, last, candles, ema20 }) {
+  try {
+    if (!supabaseEnabled || market !== "CRYPTO" || !Number.isFinite(vol) || !(last > 0)) return;
+    const band = vol >= 0.9 ? "0.9x-to-threshold" : "under-0.9x";
+    const gap = vol >= 0.9 ? 2 * 3600 * 1000 : 6 * 3600 * 1000;
+    const key = `${asset}|${band}`;
+    if (Date.now() - (GRIND_SHADOW_LAST.get(key) || 0) < gap) return;
+    GRIND_SHADOW_LAST.set(key, Date.now());
+    const atr = calculateATR(candles, ATR_PERIOD);
+    Promise.resolve(retry(() => supabase.from("grind_volume_shadow").insert({
+      symbol: asset, market, path, volume_ratio: +vol.toFixed(3), band, entry_price: last,
+      atr_pct: Number.isFinite(atr) ? +(atr / last).toFixed(5) : null,
+      dist_ema20: ema20 > 0 ? +((last - ema20) / ema20).toFixed(5) : null
+    }))).catch(() => {});
+  } catch { /* shadow only */ }
+}
+async function checkGrindShadowOutcomes() {
+  if (!supabaseEnabled) return;
+  try {
+    const now = Date.now();
+    const { data, error } = await retry(() => supabase.from("grind_volume_shadow")
+      .select("id,symbol,created_at,price_4h,price_24h")
+      .or("price_4h.is.null,price_24h.is.null")
+      .lt("created_at", new Date(now - 4 * 3600 * 1000).toISOString())
+      .gt("created_at", new Date(now - 60 * 3600 * 1000).toISOString())
+      .order("created_at").limit(60));
+    if (error || !data?.length) return;
+    const H = 3600 * 1000;
+    for (const r of data) {
+      const candles = await fetchCrypto1h(r.symbol);
+      if (!candles || !candles.length) continue;
+      const created = new Date(r.created_at).getTime(), patch = {};
+      // price ~target: close of the first CLOSED hourly candle ending at/after the target (within 1h after it)
+      const at = target => { const c = candles.find(x => x.time + H >= target && x.time + H <= now); return c ? c.close : null; };
+      if (r.price_4h == null && now >= created + 4 * H) { const p = at(created + 4 * H); if (p) patch.price_4h = p; }
+      if (r.price_24h == null && now >= created + 24 * H) { const p = at(created + 24 * H); if (p) patch.price_24h = p; }
+      if (Object.keys(patch).length) await retry(() => supabase.from("grind_volume_shadow").update(patch).eq("id", r.id));
+    }
+  } catch (e) { log(`⚠️ Grind shadow outcomes: ${e.message}`); }
+}
+async function grindShadowSummaryLines() {
+  if (!supabaseEnabled) return [];
+  try {
+    const { data } = await retry(() => supabase.from("grind_volume_shadow")
+      .select("band,entry_price,price_4h,price_24h").gt("created_at", new Date(Date.now() - 30 * 86400000).toISOString()).limit(5000));
+    if (!data?.length) return [];
+    const L = ["🧪 <b>VOLUME TEST</b> — grind candidates blocked only by volume"];
+    for (const band of ["0.9x-to-threshold", "under-0.9x"]) {
+      const rows = data.filter(x => x.band === band);
+      const stat = key => {
+        const r = rows.filter(x => x[key] != null).map(x => x[key] / x.entry_price - 1).sort((a, b) => a - b);
+        if (r.length < 5) return `${r.length} sample${r.length === 1 ? "" : "s"} so far`;
+        const med = r[Math.floor(r.length / 2)], avgR = r.reduce((a, b) => a + b, 0) / r.length;
+        return `n=${r.length} · median ${(med * 100).toFixed(2)}% · avg ${(avgR * 100).toFixed(2)}% · up ${Math.round(r.filter(v => v > 0).length / r.length * 100)}%`;
+      };
+      L.push(`${band === "under-0.9x" ? "Baseline (<0.9x)" : "Near-miss (0.9x→required)"}: ${rows.length} logged · 4h ${stat("price_4h")} · 24h ${stat("price_24h")}`);
+    }
+    L.push("<i>Price changes are raw (no fees/stops). A near-miss only matters if it clearly beats the baseline over a decent sample. No gate has changed.</i>");
+    return L;
+  } catch { return []; }
 }
 
 async function runWeeklyRegimeJob() {
@@ -5883,6 +5997,7 @@ async function analyse(asset, candles, market, prefetchedQqqMom = null) {
       noSetupSubStats[sub] = (noSetupSubStats[sub] || 0) + 1;
       // Grind / regime-override candidates that got this far: say exactly why they died here
       if (isGrindPath || isRegimeOverridePath) {
+        if (sub === "no_setup_volume") grindShadowRecord({ asset, market, path: isGrindPath ? "GRIND" : "OVERRIDE", vol: volRatio, last, candles, ema20 });
         log(`🔬 ${asset} ${isGrindPath ? "GRIND" : "OVERRIDE"} died at setup: ${sub} | vol=${volRatio.toFixed(2)}x (need pull>=${pullbackVolNeeded} break>=${breakoutVolNeeded}) nearEMA20=${nearEMA20} pulledBack=${pulledBackRecently} distFromEMA20=${(((last-ema20)/ema20)*100).toFixed(2)}% breakDist=${(breakoutDistance*100).toFixed(2)}% (limit ${(breakoutDistLimit*100).toFixed(1)}%)`);
       }
     }
@@ -6855,9 +6970,9 @@ async function closeTrade(trades, trade, closePrice, reason) {
   // Subscribers need to know the position is closed -- they think it's still running otherwise
   const isPublicReplace = reason === "REPLACED" && trade.sentToChannel;
   if (isPublicClose || isPublicReplace) {
-    await safeRun(`close${trade.asset}`, () => sendBoth(buildCloseMessage(trade, reason, closePrice)));
+    await safeRun(`close${trade.asset}`, () => sendBoth(buildCloseMessage(trade, reason, closePrice), "signals"));
   } else {
-    await safeRun(`close${trade.asset}`, () => sendPrivate(buildCloseMessage(trade, reason, closePrice)));
+    await safeRun(`close${trade.asset}`, () => sendPrivate(buildCloseMessage(trade, reason, closePrice), "signals"));
   }
   await saveTradesCached(trades);
 }
@@ -6934,26 +7049,26 @@ async function manageTrades() {
       if (invalid) {
         trade.status="CANCELLED"; trade.outcome="STRUCTURE_INVALID";
         trade.closedAt=nowIso(); trade.closePrice=livePrice; changed=true;
-        await safeRun(`invalid${trade.asset}`, () => sendPrivate(buildCloseMessage(trade,"STRUCTURE_INVALID",livePrice)));
+        await safeRun(`invalid${trade.asset}`, () => sendPrivate(buildCloseMessage(trade,"STRUCTURE_INVALID",livePrice), "signals"));
         continue;
       }
       if (drifted) {
         trade.status="CANCELLED"; trade.outcome="DRIFTED_TOO_FAR";
         trade.closedAt=nowIso(); trade.closePrice=livePrice; changed=true;
-        await safeRun(`drift${trade.asset}`, () => sendPrivate(buildCloseMessage(trade,"DRIFTED_TOO_FAR",livePrice)));
+        await safeRun(`drift${trade.asset}`, () => sendPrivate(buildCloseMessage(trade,"DRIFTED_TOO_FAR",livePrice), "signals"));
         continue;
       }
       if (dropped) {
         trade.status="CANCELLED"; trade.outcome="DRIFTED_TOO_FAR";
         trade.closedAt=nowIso(); trade.closePrice=livePrice; changed=true;
         log(`📉 Conditional dropped: ${trade.asset} -- price fell 3% below trigger`);
-        await safeRun(`drop${trade.asset}`, () => sendPrivate(buildCloseMessage(trade,"DRIFTED_TOO_FAR",livePrice)));
+        await safeRun(`drop${trade.asset}`, () => sendPrivate(buildCloseMessage(trade,"DRIFTED_TOO_FAR",livePrice), "signals"));
         continue;
       }
       if (ageHours > expiry) {
         trade.status="CANCELLED"; trade.outcome="PENDING_EXPIRED";
         trade.closedAt=nowIso(); trade.closePrice=livePrice; changed=true;
-        await safeRun(`expired${trade.asset}`, () => sendPrivate(buildCloseMessage(trade,"PENDING_EXPIRED",livePrice)));
+        await safeRun(`expired${trade.asset}`, () => sendPrivate(buildCloseMessage(trade,"PENDING_EXPIRED",livePrice), "signals"));
         continue;
       }
     }
@@ -7116,7 +7231,10 @@ async function fetchHunterContext() {
   }
 }
 
+let scanProgress = { t0: 0, done: [] };
 async function scan() {
+  const _timings = [];
+  scanProgress = { t0: Date.now(), done: _timings };
   await fetchHunterContext();
   // IO FIX: was calling the raw, uncached loadAlerts/loadTrades every
   // cycle -- a free in-memory cache already existed for exactly this
@@ -7130,6 +7248,11 @@ async function scan() {
   const _qqqMomThisCycle = await getQQQMomentum();
 
   async function processAsset(asset, market, fetcher) {
+    const _t0 = Date.now();
+    try { return await processAssetInner(asset, market, fetcher); }
+    finally { _timings.push([asset, Date.now() - _t0]); }
+  }
+  async function processAssetInner(asset, market, fetcher) {
     if (cooldown(asset, alerts, market)) return;
     if (trades.some(t => t.asset===asset && (t.status==="PENDING"||(t.status==="FILLED"&&t.outcome==="OPEN")))) return;
 
@@ -7229,6 +7352,7 @@ async function scan() {
     await mapWithConcurrency(LSE_POOL, MAX_CONCURRENT_REQUESTS, asset => processAsset(asset,"LSE",fetchLSEData));
   }
 
+  log(`⏱ scan done in ${((Date.now() - scanProgress.t0) / 1000).toFixed(0)}s | ${_timings.length} assets | slowest: ${[..._timings].sort((a, b) => b[1] - a[1]).slice(0, 4).map(x => `${x[0]} ${(x[1] / 1000).toFixed(1)}s`).join(", ")}`);
   return pickTopSignals(results);
 }
 
@@ -7880,9 +8004,13 @@ async function safeCycle() {
     // V101: momentum leaderboard check -- throttled to ~every 12 minutes.
     // Doesn't need every-cycle frequency (heat decays over hours, not
     // seconds) and this avoids hammering Supabase on every 60-90s scan.
-    if (Date.now() - lastLeaderboardCheck > 12 * 60 * 1000) {
+    if (ROUTINE_ALERTS && Date.now() - lastLeaderboardCheck > 12 * 60 * 1000) { // leaderboard only feeds muted routine alerts (and its table does not exist)
       lastLeaderboardCheck = Date.now();
       await safeRun("momentumLeaderboard", runMomentumLeaderboardCheck);
+    }
+    if (Date.now() - lastGrindShadowCheck > 20 * 60 * 1000) {
+      lastGrindShadowCheck = Date.now();
+      await safeRun("grindShadowOutcomes", checkGrindShadowOutcomes);
     }
     if (Date.now() - lastRejectionOutcomeCheck > 40 * 60 * 1000) {
       lastRejectionOutcomeCheck = Date.now();
@@ -7921,6 +8049,10 @@ async function safeCycle() {
     }
   } catch (err) {
     log("CYCLE ERROR:", err?.message||err);
+    if (/Timeout: scan/.test(String(err?.message || err))) {
+      const d = scanProgress.done;
+      log(`⏱ scan timed out after ${((Date.now() - scanProgress.t0) / 1000).toFixed(0)}s | finished ${d.length} assets (pool: ${CRYPTO_PAIRS.length} crypto, ${STOCK_POOL.length} stocks) | slowest: ${[...d].sort((a, b) => b[1] - a[1]).slice(0, 4).map(x => `${x[0]} ${(x[1] / 1000).toFixed(1)}s`).join(", ")}`);
+    }
   } finally {
     running = false;
   }
@@ -8392,6 +8524,7 @@ async function sendWeeklyReview(ctx) {
   }
 
   if (grinders) { L.push(...pickerGrindersLines(grinders)); L.push(""); }
+  try { const gsl = await grindShadowSummaryLines(); if (gsl.length) { L.push(...gsl); L.push(""); } } catch { /* optional */ }
 
   // scorecard
   const nav0 = pickerState.nav[0];
@@ -8438,7 +8571,7 @@ async function runPickerBacktest() {
     const all = { ...Object.fromEntries(Object.entries(sb).map(([k, v]) => [k, { cls: "stock", bars: v }])), ...Object.fromEntries(Object.entries(cb).map(([k, v]) => [k, { cls: "crypto", bars: v }])) };
     const idxAt = (bars, t) => { let lo = 0, hi = bars.length - 1, r = -1; while (lo <= hi) { const m = (lo + hi) >> 1; if (bars[m].t <= t) { r = m; lo = m + 1; } else hi = m - 1; } return r; };
     const spyAll = sb["SPY"] || [], btcAll = cb["BTCUSDT"] || [];
-    if (!spyAll.length || !btcAll.length) { await sendBoth("🧪 Backtest could not run: no SPY/BTC history returned."); return; }
+    if (!spyAll.length || !btcAll.length) { await sendBoth("🧪 Backtest could not run: no SPY/BTC history returned.", "status"); return; }
     pickerTiltOff = true;
     let nav = 1, peak = 1, mdd = 0, held = [], pending = null;
     const trades = [], navCurve = [];
@@ -8548,14 +8681,14 @@ async function runPickerBacktest() {
     L.push("<b>Best 5 trades</b>: " + (sorted.slice(-5).reverse().map(t => `${t.sym.replace("USDT", "")} ${f(t.ret)}`).join(", ") || "none"));
     L.push("");
     L.push(`<i>Earnings filter and Intel tilt not replayed. It posts once only; set PICKER_BACKTEST=rerun to repeat.</i>`);
-    await sendBoth(L.join("\n"));
+    await sendBoth(L.join("\n"), "status");
     pickerState.backtestDoneAt = new Date().toISOString();
     await pickerSaveState();
     log(`🧪 BACKTEST done: ${trades.length} trades, nav ${nav.toFixed(3)}`);
   } catch (e) {
     pickerTiltOff = false;
     log(`🧪 BACKTEST ERROR: ${e.stack || e.message}`);
-    await sendBoth(`🧪 Backtest failed: ${escapeHtml(e.message)}`);
+    await sendBoth(`🧪 Backtest failed: ${escapeHtml(e.message)}`, "status");
   }
 }
 
