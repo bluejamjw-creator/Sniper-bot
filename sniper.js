@@ -1982,6 +1982,30 @@ function volumeProrateFactor(candles) {
   } catch { return 1; }
 }
 
+// Momentum over a full trailing candle-length window, not just the slice of the
+// still-forming candle. 2 minutes into a 15m candle, (last-prev)/prev only sees
+// 2 minutes of movement, so the same floor was being judged on 2m vs 15m of
+// data depending on when the scan landed. Blend in the unfinished part of the
+// window from the last completed candle. Floors are unchanged.
+// Set MOM_TRAILING=0 to restore the old measurement.
+const MOM_TRAILING = process.env.MOM_TRAILING !== "0";
+function trailingMomentum(candles) {
+  const n = candles.length;
+  const last = candles[n - 1]?.close, prev = candles[n - 2]?.close, prev2 = candles[n - 3]?.close;
+  const raw = (last - prev) / prev;
+  try {
+    if (!MOM_TRAILING || n < 3 || !(prev2 > 0)) return raw;
+    const t = candles[n - 1].time, t1 = candles[n - 2].time, t2 = candles[n - 3].time;
+    if (!Number.isFinite(t) || !Number.isFinite(t1) || !Number.isFinite(t2)) return raw;
+    const step = Math.min(t - t1, t1 - t2);
+    if (!(step >= 60 * 1000) || step > 2 * 3600 * 1000) return raw;
+    const elapsed = Date.now() - t;
+    if (elapsed < 0 || elapsed >= step) return raw;
+    const f = Math.max(0, elapsed / step);
+    return raw + (1 - f) * ((prev - prev2) / prev2);
+  } catch { return raw; }
+}
+
 function getVolumeRatioAtIndex(candles, idx, market) {
   if (!candles[idx]) return 0;
   const baseVol = getAverageVolumeBeforeIndex(candles, idx, market);
@@ -5647,7 +5671,7 @@ async function analyse(asset, candles, market, prefetchedQqqMom = null) {
   const prev = closes.at(-2);
   if (!Number.isFinite(last) || !Number.isFinite(prev) || prev <= 0) return null;
 
-  const momentum = (last - prev) / prev;
+  const momentum = trailingMomentum(candles);
 
   // ── Mode selection ────────────────────────────────────────────
   const inUSOpen  = market === "US" && isUSOpeningWindow();
@@ -8742,6 +8766,54 @@ function pickerGrindersLines(g) {
 }
 
 // ── Main run ─────────────────────────────────────────────────────
+// ── Pick of the Day (stock + coin) with a 3-day conviction boost ──
+// Top-ranked asset per class by the picker's own score. Streak = consecutive daily
+// runs at #1. Streak is computed on the RAW rank (never the boosted points), so the
+// boost can't feed back into who is #1. Display + label only: entry/exit rules are untouched.
+const POTD = process.env.POTD !== "0";
+const POTD_BOOST_DAYS = Number(process.env.POTD_BOOST_DAYS || 3);
+function potdUpdate(ranked) {
+  if (!Array.isArray(pickerState.topLog)) pickerState.topLog = [];
+  const today = getUkDateString();
+  const topOf = cls => ranked.find(r => r.cls === cls) || null;
+  const s = topOf("stock"), c = topOf("crypto");
+  const entry = { d: today, stock: s?.sym || null, crypto: c?.sym || null };
+  const i = pickerState.topLog.findIndex(x => x.d === today);
+  if (i >= 0) pickerState.topLog[i] = entry; else pickerState.topLog.push(entry);
+  if (pickerState.topLog.length > 60) pickerState.topLog = pickerState.topLog.slice(-60);
+  const streakOf = (key, sym) => {
+    if (!sym) return 0;
+    let n = 0;
+    for (let k = pickerState.topLog.length - 1; k >= 0 && pickerState.topLog[k][key] === sym; k--) n++;
+    return n;
+  };
+  const mk = (r, key) => {
+    if (!r) return null;
+    const streak = streakOf(key, r.sym);
+    const boostPct = streak >= POTD_BOOST_DAYS ? Math.min(30, 10 * (streak - POTD_BOOST_DAYS + 1)) : 0;
+    const pts = r.score;
+    return { sym: r.sym, cls: r.cls, price: r.price, stop: r.stop, riskPct: r.riskPct, ext: r.ext, r63: r.r63, b63: r.b63, benchName: r.benchName, streak, pts, boosted: pts * (1 + boostPct / 100), boostPct };
+  };
+  return { stock: mk(s, "stock"), crypto: mk(c, "crypto") };
+}
+function potdLines(p, stockReg, cryptoReg, held) {
+  const nm = x => x.replace("USDT", "");
+  const pc = x => `${x >= 0 ? "+" : ""}${(x * 100).toFixed(1)}%`;
+  const L = [`🎯 <b>PICK OF THE DAY</b> — ${new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "short", timeZone: "Europe/London" })}`];
+  const row = (label, x, reg) => {
+    if (!x) { L.push(`${label}: none — ${reg.ok ? "nothing passes every test" : "market below its 200-day, no new entries"}`); return; }
+    const isHeld = (held || []).some(h => h.sym === x.sym);
+    const status = x.boostPct > 0 ? `🔥 <b>Day ${x.streak} at #1 — upgraded to POTENTIAL BUY</b>` : `Day ${x.streak} at #1 — watching (upgrade after ${POTD_BOOST_DAYS} days)`;
+    L.push(`${label}: <b>${nm(x.sym)}</b> · ${pkFmt(x.price)} · ${status}${isHeld ? " · already a pick" : ""}`);
+    L.push(`   Points ${x.pts.toFixed(1)}${x.boostPct > 0 ? ` → <b>${x.boosted.toFixed(1)}</b> (+${x.boostPct}% persistence boost)` : ""} · 3m ${pc(x.r63)} vs ${x.benchName} ${pc(x.b63)} · ${pc(x.ext)} above 20-day · stop ${pkFmt(x.stop)} (${(x.riskPct * 100).toFixed(1)}% risk)`);
+  };
+  row("📈 Stock", p.stock, stockReg);
+  row("🪙 Coin", p.crypto, cryptoReg);
+  L.push("");
+  L.push(`<i>Staying at #1 for ${POTD_BOOST_DAYS}+ days is evidence the strength is persistent, not a one-day spike. The boost is a label and does not change the picker's buy/sell rules.</i>`);
+  return L;
+}
+
 async function runPicker(reason = "scheduled") {
   if (pickerRunning) return;
   pickerRunning = true;
@@ -8810,7 +8882,10 @@ async function runPicker(reason = "scheduled") {
     if (pickerState.nav.length > 800) pickerState.nav = pickerState.nav.slice(-800);
     pickerState.lastRunDate = getUkDateString();
     pickerState.lastCash = picks.length === 0;
+    let potd = null;
+    try { if (POTD) potd = potdUpdate(ranked); } catch (e) { log(`⚠️ POTD failed: ${e.message}`); }
     await pickerSaveState();
+    if (potd) await safeRun("potd", () => sendBoth(potdLines(potd, stockReg, cryptoReg, picks).join("\n"), "picks"));
     await ledgerPickerSync({ scores, bySym, picks, prevHeld, closedNow });
     let grinders = null;
     try {
