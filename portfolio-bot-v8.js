@@ -1,5 +1,5 @@
 // =====================================================================================
-// portfolio-bot-v8.js — fomo-watch v2 🏹 (data from fomoapi.io, alerts to Discord; temporarily replacing Hunter — Hunter backup: portfolio-bot-v8-hunter-backup.js)
+// portfolio-bot-v8.js — fomo-watch v3 🏹 (fomoapi.io + on-chain wallet watch via Helius, alerts to Discord; temporarily replacing Hunter — Hunter backup: portfolio-bot-v8-hunter-backup.js)
 // Follows consistently profitable Fomo traders and alerts the private Telegram channel
 // when 3+ of them buy the same token within 4 hours. Observation mode tracks every
 // alert's outcome for 7 days and sends a weekly evidence report (Sunday ~18:00 UK).
@@ -7,6 +7,7 @@
 // Single file, no npm packages. Needs Node 22.13+ (built-in SQLite and WebSocket).
 //   node portfolio-bot-v8.js          run the bot
 //   node portfolio-bot-v8.js probe    check the fomoapi.io key, data shapes and live feed (~750 credits)
+//   node portfolio-bot-v8.js onchain  check the Helius key and decode a few real trader transactions (~30 credits)
 //   node portfolio-bot-v8.js report   print the evidence report
 //
 // Data: fomoapi.io (Fomo leaderboard, trader positions, live buy feed over WebSocket;
@@ -60,6 +61,12 @@ const CFG = {
   ALSO_TELEGRAM: bool('ALSO_TELEGRAM', false),
   DB_PATH: str('DB_PATH', '/data/fomo-watch.db'),       // Railway volume mounted at /data
   DEXSCREENER_BASE_URL: str('DEXSCREENER_BASE_URL', 'https://api.dexscreener.com'),
+
+  // On-chain wallet watch (optional, recommended): free key from helius.dev. Sees every Solana buy.
+  HELIUS_API_KEY: str('HELIUS_API_KEY', ''),
+  HELIUS_RPC_URL: str('HELIUS_RPC_URL', 'https://mainnet.helius-rpc.com/?api-key='),
+  HELIUS_WS_URL: str('HELIUS_WS_URL', 'wss://mainnet.helius-rpc.com/?api-key='),
+  HELIUS_DAILY_TX_CAP: num('HELIUS_DAILY_TX_CAP', 25000), // ~750k/month, inside the free plan's 1M credits
 
   // --- Mode ---  OBSERVATION: alerts tagged as observations. LIVE: tagged as buy alerts. Tracking on in both.
   MODE: str('MODE', 'OBSERVATION').toUpperCase(),
@@ -261,10 +268,18 @@ function dbOpen(dbPath = CFG.DB_PATH) {
     -- Per-trader win rate from recent closed positions (cached; each check costs credits).
     CREATE TABLE IF NOT EXISTS trader_stats (handle TEXT PRIMARY KEY, win_rate REAL, closed_n INTEGER, checked_at INTEGER NOT NULL);
 
+    -- Transactions already decoded by the on-chain watcher (prevents double counting after restarts).
+    CREATE TABLE IF NOT EXISTS seen_sigs (sig TEXT PRIMARY KEY, ts INTEGER NOT NULL);
+    CREATE INDEX IF NOT EXISTS seen_sigs_ts ON seen_sigs (ts);
+
     -- API usage and fetch health (saturated = some buys in that window may be missing).
     CREATE TABLE IF NOT EXISTS fetch_log (ts INTEGER NOT NULL, endpoint TEXT NOT NULL, status INTEGER, rows INTEGER, saturated INTEGER DEFAULT 0);
     CREATE INDEX IF NOT EXISTS fetch_log_ts ON fetch_log (ts);
   `);
+  // Columns added after the first release (older databases on the volume get them here).
+  for (const ddl of ['ALTER TABLE traders ADD COLUMN sol_wallets TEXT']) {
+    try { db.exec(ddl); } catch { /* already there */ }
+  }
   return db;
 }
 
@@ -420,6 +435,7 @@ async function getPrices(chain, mints) {
         pairCreatedAt: toNum(best.pairCreatedAt),
         change1h: toNum(best.priceChange && best.priceChange.h1),
         url: best.url,
+        symbol: best.baseToken.symbol,
       });
     }
   }
@@ -553,6 +569,14 @@ const PNL_KEYS = ['pnlUsd', 'pnl_usd', 'pnl', 'realizedPnlUsd'];
 const TRADES_KEYS = ['trades', 'numTrades', 'swapCount', 'trade_count'];
 const RANK_KEYS = ['rank', 'position'];
 
+// A leaderboard row's Solana wallet(s). The field may be a string, an array, or objects.
+const SOL_ADDR_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+function solanaWallets(r) {
+  const raw = first(r, ['wallets.solana', 'wallets.sol', 'solana', 'solanaWallet', 'solana_wallet']);
+  const list = (Array.isArray(raw) ? raw : [raw]).map((w) => (w && typeof w === 'object' ? first(w, ['address', 'wallet', 'pubkey']) : w));
+  return [...new Set(list.filter((w) => typeof w === 'string' && SOL_ADDR_RE.test(w)))];
+}
+
 function readBoard(body) {
   const map = new Map();
   pickArray(body, ['traders', 'data', 'items', 'results', 'leaderboard']).forEach((r, i) => {
@@ -563,6 +587,7 @@ function readBoard(body) {
       pnl: toNum(first(r, PNL_KEYS)),
       trades: toNum(first(r, TRADES_KEYS)),
       userId: first(r, ['userId', 'user_id', 'id']),
+      solWallets: solanaWallets(r),
     });
   });
   return map;
@@ -641,6 +666,7 @@ async function refreshTraders() {
       pnl7: a.pnl,
       pnl30: b.pnl,
       trades: b.trades ?? a.trades,
+      solWallets: [...new Set([...(b.solWallets || []), ...(a.solWallets || [])])],
       reason,
     });
   };
@@ -676,14 +702,15 @@ async function refreshTraders() {
   try {
     db.prepare('UPDATE traders SET active = 0').run();
     const up = db.prepare(`
-      INSERT INTO traders (handle, active, win_rate, trades, pnl_7d, pnl_30d, rank_7d, rank_30d, reason, selected_at, updated_at)
-      VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO traders (handle, active, win_rate, trades, pnl_7d, pnl_30d, rank_7d, rank_30d, reason, selected_at, updated_at, sol_wallets)
+      VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(handle) DO UPDATE SET active = 1, win_rate = excluded.win_rate, trades = excluded.trades,
         pnl_7d = excluded.pnl_7d, pnl_30d = excluded.pnl_30d, rank_7d = excluded.rank_7d, rank_30d = excluded.rank_30d,
-        reason = excluded.reason, updated_at = excluded.updated_at`);
+        reason = excluded.reason, updated_at = excluded.updated_at, sol_wallets = excluded.sol_wallets`);
     for (const c of selected) {
       const win = c.closedN >= CFG.MIN_CLOSED_FOR_WIN_RATE ? c.win : undefined;
-      up.run(c.handle, win ?? null, c.trades ?? null, c.pnl7 ?? null, c.pnl30 ?? null, c.rank7 ?? null, c.rank30 ?? null, c.reason, now, now);
+      up.run(c.handle, win ?? null, c.trades ?? null, c.pnl7 ?? null, c.pnl30 ?? null, c.rank7 ?? null, c.rank30 ?? null, c.reason, now, now,
+        c.solWallets && c.solWallets.length ? JSON.stringify(c.solWallets) : null);
     }
     db.exec('COMMIT');
   } catch (e) {
@@ -695,7 +722,8 @@ async function refreshTraders() {
   const next = new Set(selected.map((c) => c.handle));
   const added = [...next].filter((h) => !prev.has(h)).length;
   const dropped = [...prev].filter((h) => !next.has(h)).length;
-  log.info(`Following ${selected.length} traders (7d board ${lb7.size}, 30d board ${lb30.size}; +${added} −${dropped}) in ${Math.round((Date.now() - started) / 1000)}s · credits used today ${creditsUsed()}`);
+  const withWallets = selected.filter((c) => c.solWallets && c.solWallets.length).length;
+  log.info(`Following ${selected.length} traders, ${withWallets} with Solana wallets (7d board ${lb7.size}, 30d board ${lb30.size}; +${added} −${dropped}) in ${Math.round((Date.now() - started) / 1000)}s · credits used today ${creditsUsed()}`);
   return [...next];
 }
 
@@ -847,14 +875,22 @@ function parseBuy(r) {
     symbol: tokenObj ? first(tokenObj, ['symbol', 'ticker']) : (typeof r.token === 'string' ? r.token : first(r, ['symbol', 'token_symbol'])),
     // The feed's usdValue isn't always the fill size; prefer tradeUsd when present.
     usd: toNum(first(r, ['tradeUsd', 'usdValue', 'usd', 'usd_amount'])),
-    id: first(r, ['eventId', 'txHash', 'tradeId', 'id']),
+    // Transaction hash first, so the same buy seen by both the feed and the on-chain watcher is one row.
+    id: first(r, ['txHash', 'signature', 'eventId', 'tradeId', 'id']),
   };
 }
 
-// Store one buy if it's from a followed trader and passes the filters. Returns true if new.
+// A buy from the fomoapi.io feed. Solana buys by traders the on-chain watcher already covers are
+// skipped while that watcher is healthy (it sees every buy, not just the large ones).
 function ingestBuy(raw) {
   const b = parseBuy(raw);
   if (b.ts && b.ts > Number(kvGet('last_buy_seen_ts') || 0)) kvSet('last_buy_seen_ts', Math.min(b.ts, Date.now()));
+  if (b.chain === 'solana' && onchainCovers(b.handle)) return false;
+  return storeBuy(b);
+}
+
+// Store one buy if it's from a followed trader and passes the filters. Returns true if new.
+function storeBuy(b) {
   if (b.action && !['buy', 'bought', 'swap_in', 'whale'].includes(b.action)) return false;
   if (!b.handle || !trackedSet().has(b.handle) || !b.mint) return false;
   const ts = b.ts || Date.now();
@@ -1002,6 +1038,7 @@ async function fireAlert(t, now) {
   const firstTs = Math.min(...t.buys.map((b) => b.first_ts));
   const lastTs = Math.max(...t.buys.map((b) => b.last_ts));
   const p = await getPrice(t.chain, t.mint).catch(() => undefined);
+  if (!t.symbol && p && p.symbol) t.symbol = p.symbol; // on-chain buys arrive without a ticker
 
   const a = {
     created_at: now,
@@ -1038,6 +1075,306 @@ async function maybeUpgrade(alert, t, now) {
   await tgSend(upgradeMessage(alert, t.buys.length, newHandles, p && p.price));
   db.prepare('UPDATE alerts SET upgraded_at = ?, upgraded_n = ? WHERE id = ?').run(now, t.buys.length, alert.id);
   log.info(`UPGRADE ${alert.symbol || alert.mint}: ${alert.n_traders} -> ${t.buys.length}`);
+}
+
+// =====================================================================================
+// SECTION 9b — ON-CHAIN WALLET WATCH (Helius, Solana)
+// Subscribes to every followed trader's Solana wallet and decodes each transaction itself, so
+// it sees every buy (not only the larger ones the fomoapi.io feed carries).
+//   logsSubscribe(wallet) → new transaction signature → getTransaction → token/SOL balance changes
+//   → "spent SOL/USDC/USDT, received token X" = a buy of X worth $Y.
+// Credits (free plan 1M/month): ~1 per transaction fetched. A daily cap keeps it well inside that.
+// If the key is missing, the cap is hit or the connection drops, the fomoapi.io feed covers again.
+// =====================================================================================
+
+const WSOL = 'So11111111111111111111111111111111111111112';
+const STABLES = new Set([
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', // USDC
+  'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB', // USDT
+]);
+// Programs that never mean a swap on their own: plain transfers, token accounts, fees, memos.
+const PLUMBING_PROGRAMS = new Set([
+  '11111111111111111111111111111111',
+  'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+  'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb',
+  'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
+  'ComputeBudget111111111111111111111111111111',
+  'MemoSq4gqABAXKb96qnH8TuqgktG3BqyCqiQDgdV6Uf',
+  'Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo',
+]);
+
+const chainWatch = {
+  ws: null,
+  wantedKey: '',          // wallet set the current connection subscribed to
+  subs: new Map(),        // subscription id -> { wallet, handle }
+  pending: new Map(),     // request id -> { wallet, handle }
+  nextId: 1,
+  lastMsgAt: 0,
+  connectedAt: 0,
+  downSince: 0,
+  attempts: 0,
+  stopped: false,
+  solPrice: undefined,
+  solPriceAt: 0,
+  queue: [],
+  queued: new Set(),
+  working: false,
+};
+
+const heliusOn = () => Boolean(CFG.HELIUS_API_KEY);
+const heliusRpcUrl = () => `${CFG.HELIUS_RPC_URL}${CFG.HELIUS_API_KEY}`;
+const heliusWsUrl = () => `${CFG.HELIUS_WS_URL}${CFG.HELIUS_API_KEY}`;
+const heliusUsed = () => Number(kvGet(`helius:${utcDay()}`) || 0);
+const heliusCapped = () => heliusUsed() >= CFG.HELIUS_DAILY_TX_CAP;
+
+// Wallets of the traders currently followed: Map(wallet -> handle).
+function watchedWallets() {
+  const out = new Map();
+  for (const r of db.prepare('SELECT handle, sol_wallets FROM traders WHERE active = 1 AND sol_wallets IS NOT NULL').all()) {
+    let list = [];
+    try { list = JSON.parse(r.sol_wallets); } catch {}
+    for (const w of list) if (SOL_ADDR_RE.test(w)) out.set(w, r.handle);
+  }
+  return out;
+}
+
+// True when the on-chain watcher is live and subscribed to this trader's wallet.
+function onchainCovers(handle) {
+  if (!chainWatch.ws || !chainWatch.connectedAt || heliusCapped()) return false;
+  if (Date.now() - chainWatch.lastMsgAt > 15 * MIN) return false;
+  for (const s of chainWatch.subs.values()) if (s.handle === handle) return true;
+  return false;
+}
+
+async function heliusRpc(method, params) {
+  if (heliusCapped()) throw new ApiError(402, 'Helius daily cap reached', null);
+  kvSet(`helius:${utcDay()}`, heliusUsed() + 1);
+  const res = await fetch(heliusRpcUrl(), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+    signal: AbortSignal.timeout(20000),
+  });
+  if (res.status === 401 || res.status === 403) throw new ApiError(401, 'Helius key rejected — check HELIUS_API_KEY', null);
+  if (res.status === 429) throw new ApiError(429, 'Helius rate limited', null);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || body.error) throw new ApiError(res.status, `Helius ${method}: ${(body.error && body.error.message) || res.status}`, body);
+  return body.result;
+}
+
+async function refreshSolPrice() {
+  if (chainWatch.solPrice && Date.now() - chainWatch.solPriceAt < 5 * MIN) return chainWatch.solPrice;
+  const q = await getPrice('solana', WSOL).catch(() => undefined);
+  if (q && q.price > 1) { chainWatch.solPrice = q.price; chainWatch.solPriceAt = Date.now(); }
+  return chainWatch.solPrice;
+}
+
+// Did this transaction call anything beyond transfers/fees? (Skips plain sends without fetching.)
+function looksLikeSwap(logs) {
+  for (const line of logs || []) {
+    const m = /^Program (\S+) invoke/.exec(line);
+    if (m && !PLUMBING_PROGRAMS.has(m[1])) return true;
+  }
+  return false;
+}
+
+// Turn a getTransaction (jsonParsed) result into a buy by `wallet`, or null.
+function decodeSwap(tx, wallet, solPrice) {
+  if (!tx || !tx.meta || tx.meta.err) return null;
+  const meta = tx.meta;
+  const keys = ((tx.transaction && tx.transaction.message && tx.transaction.message.accountKeys) || [])
+    .map((k) => (typeof k === 'string' ? k : k && k.pubkey));
+  const idx = keys.indexOf(wallet);
+
+  // Native SOL change (fee added back when the wallet paid it — fees aren't money spent on the token).
+  let sol = 0;
+  if (idx >= 0 && meta.preBalances && meta.postBalances) {
+    sol = (meta.postBalances[idx] - meta.preBalances[idx]) / 1e9;
+    if (idx === 0 && meta.fee) sol += meta.fee / 1e9;
+  }
+
+  // Token changes for accounts owned by the wallet.
+  const delta = new Map();
+  const add = (b, sign) => {
+    if (!b || b.owner !== wallet) return;
+    const amt = Number(b.uiTokenAmount && (b.uiTokenAmount.uiAmountString ?? b.uiTokenAmount.uiAmount));
+    if (!Number.isFinite(amt)) return;
+    delta.set(b.mint, (delta.get(b.mint) || 0) + sign * amt);
+  };
+  for (const b of meta.preTokenBalances || []) add(b, -1);
+  for (const b of meta.postTokenBalances || []) add(b, +1);
+
+  sol += delta.get(WSOL) || 0;
+  delta.delete(WSOL);
+  let stableSpent = 0;
+  for (const m of STABLES) {
+    const d = delta.get(m) || 0;
+    if (d < 0) stableSpent += -d;
+    delta.delete(m);
+  }
+  const solSpent = sol < 0 ? -sol : 0;
+
+  const received = [...delta.entries()].filter(([, d]) => d > 0);
+  if (!received.length) return null;                 // a sell, a send, or nothing for this wallet
+  if (solSpent < 0.001 && stableSpent < 0.5) return null; // received without paying SOL/USD: transfer, airdrop or token→token
+
+  received.sort((a, b) => b[1] - a[1]);
+  const usd = (Number.isFinite(solPrice) ? solSpent * solPrice : 0) + stableSpent;
+  return {
+    mint: received[0][0],
+    usd: usd > 0 ? usd : undefined,
+    ts: tx.blockTime ? tx.blockTime * 1000 : Date.now(),
+  };
+}
+
+// Fetch + decode one signature (queued, one at a time, to stay inside the free plan's rate limit).
+function enqueueSig(sig, wallet, handle) {
+  if (chainWatch.queued.has(sig)) return;
+  if (db.prepare('SELECT 1 FROM seen_sigs WHERE sig = ?').get(sig)) return;
+  chainWatch.queued.add(sig);
+  chainWatch.queue.push({ sig, wallet, handle });
+  drainQueue();
+}
+
+async function drainQueue() {
+  if (chainWatch.working) return;
+  chainWatch.working = true;
+  try {
+    while (chainWatch.queue.length) {
+      const job = chainWatch.queue.shift();
+      if (heliusCapped()) {
+        log.warn('Helius daily cap reached — the fomoapi.io feed covers until 00:00 UTC');
+        chainWatch.queue.length = 0;
+        chainWatch.queued.clear();
+        break;
+      }
+      try {
+        await processSig(job);
+      } catch (e) {
+        if (e.status === 429) { chainWatch.queue.unshift(job); await sleep(2000); continue; }
+        log.warn(`on-chain: ${job.sig.slice(0, 8)}… failed: ${e.message}`);
+      }
+      // Released only after processing, so a repeat notification mid-fetch isn't fetched twice.
+      chainWatch.queued.delete(job.sig);
+      await sleep(150);
+    }
+  } finally {
+    chainWatch.working = false;
+  }
+}
+
+async function processSig({ sig, wallet, handle }) {
+  const tx = await heliusRpc('getTransaction', [sig, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0, commitment: 'confirmed' }]);
+  if (!tx) return; // not yet available; the next notification or catch-up will retry
+  db.prepare('INSERT OR IGNORE INTO seen_sigs (sig, ts) VALUES (?, ?)').run(sig, Date.now());
+  const buy = decodeSwap(tx, wallet, await refreshSolPrice());
+  if (!buy) return;
+  if (storeBuy({ action: 'buy', ts: buy.ts, handle, chain: 'solana', mint: buy.mint, symbol: undefined, usd: buy.usd, id: sig })) scheduleDetect();
+}
+
+// --- Connection ---
+function connectChainWatch() {
+  if (chainWatch.stopped || !heliusOn()) return;
+  const wallets = watchedWallets();
+  if (!wallets.size) { log.debug('on-chain: no wallets yet'); return; }
+  let ws;
+  try { ws = new WebSocket(heliusWsUrl()); } catch (e) { log.error('on-chain: could not open connection', e.message); return chainReconnectLater(); }
+  chainWatch.ws = ws;
+  chainWatch.subs.clear();
+  chainWatch.pending.clear();
+  chainWatch.lastMsgAt = Date.now();
+  chainWatch.wantedKey = [...wallets.keys()].sort().join(',');
+
+  ws.addEventListener('open', () => {
+    const wasDownFor = chainWatch.downSince ? Date.now() - chainWatch.downSince : 0;
+    chainWatch.connectedAt = Date.now();
+    chainWatch.attempts = 0;
+    for (const [wallet, handle] of wallets) {
+      const id = chainWatch.nextId++;
+      chainWatch.pending.set(id, { wallet, handle });
+      ws.send(JSON.stringify({ jsonrpc: '2.0', id, method: 'logsSubscribe', params: [{ mentions: [wallet] }, { commitment: 'confirmed' }] }));
+    }
+    const traders = new Set(wallets.values()).size;
+    log.info(`on-chain: watching ${wallets.size} wallets of ${traders} traders`);
+    if (chainWatch.downSince && wasDownFor > 60 * 1000) chainCatchUp().catch(() => {});
+    chainWatch.downSince = 0;
+  });
+
+  ws.addEventListener('message', (ev) => {
+    chainWatch.lastMsgAt = Date.now();
+    let msg;
+    try { msg = JSON.parse(typeof ev.data === 'string' ? ev.data : Buffer.from(ev.data).toString()); } catch { return; }
+    if (msg.id && chainWatch.pending.has(msg.id)) {
+      const who = chainWatch.pending.get(msg.id);
+      chainWatch.pending.delete(msg.id);
+      if (msg.error) log.warn(`on-chain: subscribe failed for @${who.handle}: ${msg.error.message}`);
+      else chainWatch.subs.set(msg.result, who);
+      return;
+    }
+    if (msg.method !== 'logsNotification' || !msg.params) return;
+    const who = chainWatch.subs.get(msg.params.subscription);
+    const v = msg.params.result && msg.params.result.value;
+    if (!who || !v || v.err || !v.signature) return;
+    if (!looksLikeSwap(v.logs)) return;
+    enqueueSig(v.signature, who.wallet, who.handle);
+  });
+
+  ws.addEventListener('close', (ev) => {
+    if (chainWatch.ws !== ws) return;
+    chainWatch.ws = null;
+    chainWatch.connectedAt = 0;
+    chainWatch.downSince = chainWatch.downSince || Date.now();
+    log.warn(`on-chain: connection closed (${ev.code}${ev.reason ? ' ' + ev.reason : ''})`);
+    if (ev.code === 1008 || ev.code === 4001 || ev.code === 4003) log.error('on-chain: key refused — check HELIUS_API_KEY');
+    chainReconnectLater();
+  });
+  ws.addEventListener('error', () => log.debug('on-chain: socket error'));
+}
+
+function chainReconnectLater() {
+  if (chainWatch.stopped) return;
+  chainWatch.attempts++;
+  setTimeout(connectChainWatch, Math.min(5 * MIN, 5000 * 2 ** Math.min(chainWatch.attempts - 1, 6)));
+}
+
+// After a gap, read each wallet's recent signatures so buys made while disconnected still count.
+async function chainCatchUp() {
+  const since = Date.now() - CFG.WINDOW_HOURS * H;
+  let n = 0;
+  for (const [wallet, handle] of watchedWallets()) {
+    let sigs;
+    try { sigs = await heliusRpc('getSignaturesForAddress', [wallet, { limit: 15, commitment: 'confirmed' }]); } catch (e) { log.debug('catch-up failed', e.message); continue; }
+    for (const s of sigs || []) {
+      if (s.err || (s.blockTime && s.blockTime * 1000 < since)) continue;
+      enqueueSig(s.signature, wallet, handle);
+      n++;
+    }
+    await sleep(150);
+  }
+  log.info(`on-chain catch-up: ${n} recent transactions queued`);
+}
+
+// Every few minutes: reconnect if the followed wallets changed, the link went quiet, or it never started.
+function chainWatchdog() {
+  if (!heliusOn() || chainWatch.stopped) return;
+  const want = [...watchedWallets().keys()].sort().join(',');
+  if (!chainWatch.ws) {
+    if (want && !chainWatch.attempts) connectChainWatch();
+    return;
+  }
+  if (want !== chainWatch.wantedKey) {
+    log.info('on-chain: followed traders changed — resubscribing');
+    const old = chainWatch.ws;
+    chainWatch.ws = null;
+    try { old.close(); } catch {}
+    connectChainWatch();
+    return;
+  }
+  // Wallet subscriptions can be silent for a while; a quiet link is refreshed rather than trusted.
+  if (Date.now() - chainWatch.lastMsgAt > 10 * MIN) {
+    log.debug('on-chain: quiet for 10 min — refreshing connection');
+    try { chainWatch.ws.close(); } catch {}
+  }
 }
 
 // =====================================================================================
@@ -1094,6 +1431,7 @@ async function checkOutcomes(now = Date.now()) {
 function prune(now = Date.now()) {
   const a = db.prepare('DELETE FROM buys WHERE ts < ?').run(now - CFG.RETENTION_DAYS * D);
   const b = db.prepare('DELETE FROM fetch_log WHERE ts < ?').run(now - 14 * D);
+  db.prepare('DELETE FROM seen_sigs WHERE ts < ?').run(now - 8 * D);
   if (a.changes || b.changes) log.info(`housekeeping: removed ${a.changes} old buys, ${b.changes} old fetch logs`);
 }
 
@@ -1173,7 +1511,13 @@ async function maybeRefreshTraders() {
   const last = Number(kvGet('traders_refreshed_at') || 0);
   const have = currentHandles().length;
   // Retry every 30 min until a first list exists; then once per REFRESH_TRADERS_HOURS.
-  if (have && Date.now() - last < CFG.REFRESH_TRADERS_HOURS * H) return;
+  const fresh = have && Date.now() - last < CFG.REFRESH_TRADERS_HOURS * H;
+  // The on-chain watch needs wallets; lists saved before it existed have none. Refetch (cheap: win
+  // rates are cached) — at most once a day in case the leaderboard doesn't provide them.
+  const needWallets = heliusOn() && have && !db.prepare('SELECT 1 FROM traders WHERE active = 1 AND sol_wallets IS NOT NULL').get()
+    && kvGet('wallet_refresh_on') !== utcDay();
+  if (fresh && !needWallets) return;
+  if (needWallets) kvSet('wallet_refresh_on', utcDay());
   await refreshTraders();
   trackedCache.at = 0;
 }
@@ -1191,13 +1535,13 @@ async function maybeHousekeeping() {
   const today = new Date().toISOString().slice(0, 10);
   if (kvGet('pruned_on') === today) return;
   kvSet('pruned_on', today);
-  log.info(`daily: credits used yesterday ${kvGet(`credits:${utcDay(Date.now() - D)}`) || 0} · month remaining ${kvGet('credits_remaining') ?? '?'}`);
+  log.info(`daily: fomoapi credits yesterday ${kvGet(`credits:${utcDay(Date.now() - D)}`) || 0} (month remaining ${kvGet('credits_remaining') ?? '?'}) · Helius transactions yesterday ${kvGet(`helius:${utcDay(Date.now() - D)}`) || 0}`);
   prune();
 }
 
 async function main() {
   dbOpen();
-  log.info(`fomo-watch v2 started · mode ${CFG.MODE} · trigger ${CFG.MIN_TRADERS}+ traders in ${CFG.WINDOW_HOURS}h`);
+  log.info(`fomo-watch v3 started · mode ${CFG.MODE} · trigger ${CFG.MIN_TRADERS}+ traders in ${CFG.WINDOW_HOURS}h`);
   if (CFG.DISCORD_WEBHOOK_URL) log.info(`alerts → Discord${CFG.ALSO_TELEGRAM ? ' + Telegram' : ''}`);
   else if (CFG.TELEGRAM_BOT_TOKEN && CFG.TELEGRAM_CHANNEL_ID) log.info('alerts → Telegram');
   else log.warn('No Discord webhook or Telegram variables set — alerts will only be logged');
@@ -1219,6 +1563,13 @@ async function main() {
 
   every('traders', 30 * MIN, maybeRefreshTraders);
   connectFeed();
+  if (heliusOn()) {
+    log.info(`on-chain wallet watch: on (cap ${CFG.HELIUS_DAILY_TX_CAP} transactions/day)`);
+    setInterval(chainWatchdog, 2 * MIN);
+    setTimeout(chainWatchdog, 20 * 1000);
+  } else {
+    log.info('on-chain wallet watch: off (set HELIUS_API_KEY to see every buy, not only large ones)');
+  }
   setInterval(feedWatchdog, MIN);
   every('outcomes', CFG.OUTCOME_CHECK_MINUTES * MIN, () => checkOutcomes());
   every('detect', 5 * MIN, () => detect(), { immediate: false }); // safety net alongside the live trigger
@@ -1267,11 +1618,54 @@ async function probe() {
     setTimeout(done, 60000);
   });
   console.log(`\nCredits used today: ${creditsUsed()} · month remaining: ${kvGet('credits_remaining') ?? '?'}`);
+  if (heliusOn()) await probeOnchain();
+}
+
+// Checks the Helius key and decodes a few real recent transactions of followed traders (~30 credits).
+async function probeOnchain() {
+  dbOpen();
+  if (!heliusOn()) throw new Error('HELIUS_API_KEY is not set');
+  console.log('\n=== on-chain (Helius) ===');
+  console.log('health:', JSON.stringify(await heliusRpc('getHealth', [])));
+  let wallets = watchedWallets();
+  if (!wallets.size && CFG.FOMOAPI_KEY) {
+    for (const [h, v] of readBoard(await fomo.leaderboard('7d', 10))) for (const w of v.solWallets || []) wallets.set(w, h);
+  }
+  console.log(`wallets known: ${wallets.size}`);
+  const sol = await refreshSolPrice();
+  console.log(`SOL price: ${fmtPrice(sol)}`);
+  let shown = 0;
+  for (const [wallet, handle] of [...wallets].slice(0, 3)) {
+    const sigs = await heliusRpc('getSignaturesForAddress', [wallet, { limit: 8 }]);
+    console.log(`\n@${handle} ${wallet.slice(0, 6)}… — ${sigs.length} recent transactions`);
+    for (const s of sigs) {
+      if (s.err) continue;
+      const tx = await heliusRpc('getTransaction', [s.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]);
+      const buy = decodeSwap(tx, wallet, sol);
+      const when = s.blockTime ? new Date(s.blockTime * 1000).toISOString().slice(0, 16) : '?';
+      console.log(`  ${when}  ${buy ? `BUY ${buy.mint.slice(0, 8)}… ${fmtUsd(buy.usd)}` : 'not a buy'}  ${s.signature.slice(0, 10)}…`);
+      shown++;
+    }
+  }
+  console.log('\nlive subscription test (20s):');
+  const [w0] = [...wallets.keys()];
+  if (w0) {
+    await new Promise((resolve) => {
+      const ws = new WebSocket(heliusWsUrl());
+      const done = () => { try { ws.close(); } catch {} resolve(); };
+      ws.addEventListener('open', () => ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'logsSubscribe', params: [{ mentions: [w0] }, { commitment: 'confirmed' }] })));
+      ws.addEventListener('message', (ev) => console.log(' ', String(ev.data).slice(0, 300)));
+      ws.addEventListener('close', (ev) => { console.log(`  closed ${ev.code}`); resolve(); });
+      ws.addEventListener('error', () => console.log('  socket error'));
+      setTimeout(done, 20000);
+    });
+  }
+  console.log(`\nHelius calls today: ${heliusUsed()} (decoded ${shown} transactions)`);
 }
 
 if (require.main === module) {
   const cmd = process.argv[2];
-  for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { log.info(`${sig} — shutting down`); feed.stopped = true; dbClose(); process.exit(0); });
+  for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { log.info(`${sig} — shutting down`); feed.stopped = true; chainWatch.stopped = true; dbClose(); process.exit(0); });
   process.on('unhandledRejection', (e) => log.error('unhandled rejection', e && e.message));
 
   if (cmd === 'probe') {
@@ -1279,6 +1673,8 @@ if (require.main === module) {
       console.error('probe failed:', e.message, e.body ? JSON.stringify(e.body).slice(0, 500) : '');
       process.exit(1);
     });
+  } else if (cmd === 'onchain') {
+    probeOnchain().then(() => process.exit(0)).catch((e) => { console.error('on-chain check failed:', e.message); process.exit(1); });
   } else if (cmd === 'report') {
     dbOpen();
     console.log(weeklyMessage(buildReport()).replace(/<[^>]+>/g, ''));
@@ -1295,5 +1691,6 @@ if (require.main === module) {
 module.exports = {
   dbOpen, kvGet, kvSet, get db() { return db; }, refreshTraders, ingestBuy, backfill, detect, connectFeed, feed,
   checkOutcomes, prune, buildReport, weeklyMessage, toMs, toPct, winRateFromPositions, parseBuy, htmlToDiscord, splitForDiscord,
+  decodeSwap, looksLikeSwap, solanaWallets, chainWatch, connectChainWatch, chainWatchdog, onchainCovers, storeBuy,
   _resetTracked: () => { trackedCache.at = 0; },
 };
