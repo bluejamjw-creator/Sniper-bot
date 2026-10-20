@@ -1,5 +1,5 @@
 // =====================================================================================
-// portfolio-bot-v8.js — fomo-watch v3 🏹 (fomoapi.io + on-chain wallet watch via Helius, alerts to Discord; temporarily replacing Hunter — Hunter backup: portfolio-bot-v8-hunter-backup.js)
+// portfolio-bot-v8.js — fomo-watch v3.1 🏹 (fomoapi.io + on-chain wallet watch via Helius, alerts to Discord; temporarily replacing Hunter — Hunter backup: portfolio-bot-v8-hunter-backup.js)
 // Follows consistently profitable Fomo traders and alerts the private Telegram channel
 // when 3+ of them buy the same token within 4 hours. Observation mode tracks every
 // alert's outcome for 7 days and sends a weekly evidence report (Sunday ~18:00 UK).
@@ -67,6 +67,8 @@ const CFG = {
   HELIUS_RPC_URL: str('HELIUS_RPC_URL', 'https://mainnet.helius-rpc.com/?api-key='),
   HELIUS_WS_URL: str('HELIUS_WS_URL', 'wss://mainnet.helius-rpc.com/?api-key='),
   HELIUS_DAILY_TX_CAP: num('HELIUS_DAILY_TX_CAP', 25000), // ~750k/month, inside the free plan's 1M credits
+  SOLANA_TX_VERSION: num('SOLANA_TX_VERSION', 1),         // highest Solana transaction format the bot reads
+  HELIUS_KEEPALIVE_SECONDS: num('HELIUS_KEEPALIVE_SECONDS', 50),
 
   // --- Mode ---  OBSERVATION: alerts tagged as observations. LIVE: tagged as buy alerts. Tracking on in both.
   MODE: str('MODE', 'OBSERVATION').toUpperCase(),
@@ -1122,6 +1124,8 @@ const chainWatch = {
 };
 
 const heliusOn = () => Boolean(CFG.HELIUS_API_KEY);
+// Last time anything (a notification or a keepalive reply) came back on the Helius link.
+const chainLastHeard = () => Math.max(chainWatch.alive || 0, chainWatch.lastMsgAt || 0);
 const heliusRpcUrl = () => `${CFG.HELIUS_RPC_URL}${CFG.HELIUS_API_KEY}`;
 const heliusWsUrl = () => `${CFG.HELIUS_WS_URL}${CFG.HELIUS_API_KEY}`;
 const heliusUsed = () => Number(kvGet(`helius:${utcDay()}`) || 0);
@@ -1141,7 +1145,7 @@ function watchedWallets() {
 // True when the on-chain watcher is live and subscribed to this trader's wallet.
 function onchainCovers(handle) {
   if (!chainWatch.ws || !chainWatch.connectedAt || heliusCapped()) return false;
-  if (Date.now() - chainWatch.lastMsgAt > 15 * MIN) return false;
+  if (Date.now() - chainLastHeard() > 15 * MIN) return false;
   for (const s of chainWatch.subs.values()) if (s.handle === handle) return true;
   return false;
 }
@@ -1182,8 +1186,11 @@ function looksLikeSwap(logs) {
 function decodeSwap(tx, wallet, solPrice) {
   if (!tx || !tx.meta || tx.meta.err) return null;
   const meta = tx.meta;
-  const keys = ((tx.transaction && tx.transaction.message && tx.transaction.message.accountKeys) || [])
-    .map((k) => (typeof k === 'string' ? k : k && k.pubkey));
+  const msgObj = (tx.transaction && tx.transaction.message) || {};
+  const loaded = meta.loadedAddresses || {};
+  const rawKeys = msgObj.accountKeys
+    || [...(msgObj.staticAccountKeys || []), ...(loaded.writable || []), ...(loaded.readonly || [])];
+  const keys = rawKeys.map((k) => (typeof k === 'string' ? k : k && k.pubkey));
   const idx = keys.indexOf(wallet);
 
   // Native SOL change (fee added back when the wallet paid it — fees aren't money spent on the token).
@@ -1264,7 +1271,7 @@ async function drainQueue() {
 }
 
 async function processSig({ sig, wallet, handle }) {
-  const tx = await heliusRpc('getTransaction', [sig, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0, commitment: 'confirmed' }]);
+  const tx = await heliusRpc('getTransaction', [sig, { encoding: 'jsonParsed', maxSupportedTransactionVersion: CFG.SOLANA_TX_VERSION, commitment: 'confirmed' }]);
   if (!tx) return; // not yet available; the next notification or catch-up will retry
   db.prepare('INSERT OR IGNORE INTO seen_sigs (sig, ts) VALUES (?, ?)').run(sig, Date.now());
   const buy = decodeSwap(tx, wallet, await refreshSolPrice());
@@ -1296,14 +1303,24 @@ function connectChainWatch() {
     }
     const traders = new Set(wallets.values()).size;
     log.info(`on-chain: watching ${wallets.size} wallets of ${traders} traders`);
-    if (chainWatch.downSince && wasDownFor > 60 * 1000) chainCatchUp().catch(() => {});
+    const firstConnect = !chainWatch.caughtUpOnce;
+    chainWatch.caughtUpOnce = true;
+    if (firstConnect || (chainWatch.downSince && wasDownFor > 60 * 1000)) chainCatchUp().catch(() => {});
     chainWatch.downSince = 0;
+    // Helius drops connections it thinks are idle; a small message every minute keeps it open.
+    clearInterval(chainWatch.keepAlive);
+    chainWatch.keepAlive = setInterval(() => {
+      if (chainWatch.ws !== ws) return clearInterval(chainWatch.keepAlive);
+      try { ws.send(JSON.stringify({ jsonrpc: '2.0', id: 'keepalive', method: 'getHealth' })); } catch {}
+    }, CFG.HELIUS_KEEPALIVE_SECONDS * 1000);
   });
 
   ws.addEventListener('message', (ev) => {
-    chainWatch.lastMsgAt = Date.now();
     let msg;
     try { msg = JSON.parse(typeof ev.data === 'string' ? ev.data : Buffer.from(ev.data).toString()); } catch { return; }
+    chainWatch.alive = Date.now(); // any reply, keepalive included, means the link is up
+    if (msg.id === 'keepalive') return;
+    chainWatch.lastMsgAt = Date.now();
     if (msg.id && chainWatch.pending.has(msg.id)) {
       const who = chainWatch.pending.get(msg.id);
       chainWatch.pending.delete(msg.id);
@@ -1371,8 +1388,8 @@ function chainWatchdog() {
     return;
   }
   // Wallet subscriptions can be silent for a while; a quiet link is refreshed rather than trusted.
-  if (Date.now() - chainWatch.lastMsgAt > 10 * MIN) {
-    log.debug('on-chain: quiet for 10 min — refreshing connection');
+  if (Date.now() - chainLastHeard() > 10 * MIN) {
+    log.debug('on-chain: no replies for 10 min — refreshing connection');
     try { chainWatch.ws.close(); } catch {}
   }
 }
@@ -1541,7 +1558,7 @@ async function maybeHousekeeping() {
 
 async function main() {
   dbOpen();
-  log.info(`fomo-watch v3 started · mode ${CFG.MODE} · trigger ${CFG.MIN_TRADERS}+ traders in ${CFG.WINDOW_HOURS}h`);
+  log.info(`fomo-watch v3.1 started · mode ${CFG.MODE} · trigger ${CFG.MIN_TRADERS}+ traders in ${CFG.WINDOW_HOURS}h`);
   if (CFG.DISCORD_WEBHOOK_URL) log.info(`alerts → Discord${CFG.ALSO_TELEGRAM ? ' + Telegram' : ''}`);
   else if (CFG.TELEGRAM_BOT_TOKEN && CFG.TELEGRAM_CHANNEL_ID) log.info('alerts → Telegram');
   else log.warn('No Discord webhook or Telegram variables set — alerts will only be logged');
@@ -1640,7 +1657,7 @@ async function probeOnchain() {
     console.log(`\n@${handle} ${wallet.slice(0, 6)}… — ${sigs.length} recent transactions`);
     for (const s of sigs) {
       if (s.err) continue;
-      const tx = await heliusRpc('getTransaction', [s.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }]);
+      const tx = await heliusRpc('getTransaction', [s.signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: CFG.SOLANA_TX_VERSION }]);
       const buy = decodeSwap(tx, wallet, sol);
       const when = s.blockTime ? new Date(s.blockTime * 1000).toISOString().slice(0, 16) : '?';
       console.log(`  ${when}  ${buy ? `BUY ${buy.mint.slice(0, 8)}… ${fmtUsd(buy.usd)}` : 'not a buy'}  ${s.signature.slice(0, 10)}…`);
