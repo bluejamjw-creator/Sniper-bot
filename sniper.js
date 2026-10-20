@@ -8160,6 +8160,10 @@ let pickerMaxPicks = PICKER_MAX_PICKS_DEFAULT; // mutable only so the backtest c
 const PICKER_STOP_ATR     = 2.5;   // initial stop = close - 2.5 x ATR14
 const PICKER_SWAP_MARGIN  = 1.25;  // challenger must beat a held pick's score by 25% to force a rotation
 const PICKER_MAX_EXT_SMA20 = 1.18; // skip assets >18% above SMA20 (don't chase)
+// Liquidity floor. The daily bars come from Alpaca's free IEX feed, which carries only a few percent of real
+// trading volume, so the old 20e6 floor (meant as ~$20M/day of REAL trading) rejected liquid names (MRNA: 126 "illiquid" days
+// in the backtest). 1e6 of IEX dollar volume is roughly $25-50M+ of real daily trading. Override with PICKER_MIN_DOLLAR_VOL.
+const PICKER_MIN_DOLLAR_VOL = Number(process.env.PICKER_MIN_DOLLAR_VOL || 1e6);
 const PICKER_MAX_5D_RET   = 0.30;  // skip assets already +30% in 5 days
 
 let pickerState = { holdings: [], closed: [], nav: [], lastRunDate: "", startedAt: null, lastCash: false, events: [], lastReviewWeek: "", grindersSentAt: "" };
@@ -8267,7 +8271,7 @@ function pickerScoreAsset(sym, bars, cls, bench) {
   const stopPx = last - PICKER_STOP_ATR * atr;
   const base = { sym, cls, price: last, atr, stop: stopPx, sma20, sma50, sma200, r5, r21, r63, r126, b63, rs: r63 - b63, ext: last / sma20 - 1, riskPct: (last - stopPx) / last, benchName: cls === "stock" ? "SPY" : "BTC" };
   if (cls === "stock" && last < 5) return { ...base, ok: false, why: "price<5" };
-  if (cls === "stock" && dollarVol < 20e6) return { ...base, ok: false, why: "illiquid" };
+  if (cls === "stock" && dollarVol < PICKER_MIN_DOLLAR_VOL) return { ...base, ok: false, why: "illiquid" };
   if (!(last > sma50 && sma50 > sma200)) return { ...base, ok: false, why: "trend" };
   if (!(r63 > b63 && r63 > 0)) return { ...base, ok: false, why: "no rel strength" };
   if (last / sma20 > PICKER_MAX_EXT_SMA20) return { ...base, ok: false, why: "extended" };
@@ -8614,7 +8618,7 @@ async function sendWeeklyReview(ctx) {
 // What it is NOT: a reconstruction of what the bot did in April, and it carries survivorship bias --
 // the universe is today's lists (plus INJ, NEAR, QNT, MRNA), so names that dropped out are missing.
 // Bump this when the backtest's content changes: it then posts once on the next deploy, never on every restart.
-const BACKTEST_VERSION = "v3-positions";
+const BACKTEST_VERSION = "v4-liquidity";
 async function runPickerBacktest() {
   try {
     if (!pickerLoadState()) await pickerLoadStateRemote();
