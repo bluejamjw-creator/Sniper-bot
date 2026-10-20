@@ -1752,8 +1752,11 @@ async function sendSignalsChannels(msg) {
   await sendDiscord(DISCORD_WEBHOOK_SIGNALS, msg);
 }
 
+// Movers / market intel / top performers / morning briefing -> Discord #market-intel.
+// ON by default; INTEL_ALERTS=0 mutes them again. (Other routine alerts stay behind ROUTINE_ALERTS.)
+const INTEL_ALERTS = process.env.INTEL_ALERTS !== "0";
 async function sendIntelChannels(msg) {
-  if (!ROUTINE_ALERTS) return; // narrative/briefing posts are OFF; discovery logging still runs
+  if (!ROUTINE_ALERTS && !INTEL_ALERTS) return; // discovery logging still runs either way
   await sendChannel(msg, "intel");
   await sendDiscord(DISCORD_WEBHOOK_INTEL, msg);
 }
@@ -5191,18 +5194,18 @@ async function fetchYahoo5mAs15m(symbol) {
 // ── Stooq (no key required, delayed intraday) ────────────────────
 // Better than Yahoo for fallback -- no rate limiting, delayed OHLCV
 // Used when Yahoo throttles standard US stocks
-async function fetchStooqBars(symbol) {
+async function fetchStooqBars(symbol, opts = {}) {
   const cacheKey = `stooq_${symbol}`;
   const cached   = getCached(cacheKey);
   if (cached) return cached;
   try {
     const { data } = await retry(() =>
       axios.get(`https://stooq.com/q/d/l/`, {
-        params: { s: `${symbol}.us`, i: "d" }, // daily bars
-        timeout: 10000,
+        params: { s: /\.uk$/i.test(symbol) ? symbol : `${symbol}.us`, i: "d" }, // daily bars (symbols with a suffix, e.g. lloy.uk, are used as-is)
+        timeout: opts.timeout ?? 10000,
         responseType: "text"
       })
-    );
+    , opts.retries ?? 2);
     if (!data || data.includes("No data")) return null;
     const lines = data.trim().split("\n").slice(1); // skip header
     const candles = lines.map(line => {
@@ -5310,7 +5313,7 @@ async function fetchLSEData(symbol) {
   // V98: hard 3-second timeout with proper axios timeout -- prevents scan cycle timeouts
   let candles = null;
   try {
-    const { data } = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.L`, {
+    const { data } = await axios.get(`https://query1.finance.yahoo.com/v8/finance/chart/${symbol.replace(/\.L$/i, "")}.L`, { // pool symbols already end in .L -- was requesting X.L.L (404)
       params: {interval:"1h", range:"60d", includePrePost:false},
       headers: {"User-Agent":"Mozilla/5.0"},
       timeout: 3000  // hard 3s -- if Yahoo doesn't respond in 3s skip it
@@ -5328,7 +5331,7 @@ async function fetchLSEData(symbol) {
   if (!candles || candles.length === 0) {
     try {
       const stooqSym = symbol.replace(".L","").toLowerCase() + ".uk";
-      candles = await fetchStooqBars(stooqSym);
+      candles = await fetchStooqBars(stooqSym, { retries: 0, timeout: 4000 });
     } catch { /* Stooq also failed */ }
   }
   if (candles && candles.length > 0) setCache(cacheKey, candles);
@@ -7258,14 +7261,14 @@ async function fetchHunterContext() {
 let scanProgress = { t0: 0, done: [] };
 async function scan() {
   const _timings = [];
-  scanProgress = { t0: Date.now(), done: _timings };
+  const myScan = scanProgress = { t0: Date.now(), done: _timings, results: [] };
   await fetchHunterContext();
   // IO FIX: was calling the raw, uncached loadAlerts/loadTrades every
   // cycle -- a free in-memory cache already existed for exactly this
   // (loadAlertsCached/loadTradesCached) but wasn't being used here.
   const alerts  = await loadAlertsCached();
   const trades  = await loadTradesCached();
-  const results = [];
+  const results = myScan.results; // exposed so a timed-out scan can still use what it already found
 
   // V98: pre-fetch QQQ momentum once per cycle not per asset
   // Reduces async overhead and ensures consistent regime across all assets in scan
@@ -7277,6 +7280,7 @@ async function scan() {
     finally { _timings.push([asset, Date.now() - _t0]); }
   }
   async function processAssetInner(asset, market, fetcher) {
+    if (scanProgress !== myScan) return; // this scan timed out and a newer one started -- stop doing work
     if (cooldown(asset, alerts, market)) return;
     if (trades.some(t => t.asset===asset && (t.status==="PENDING"||(t.status==="FILLED"&&t.outcome==="OPEN")))) return;
 
@@ -7373,7 +7377,7 @@ async function scan() {
     await mapWithConcurrency(STOCK_POOL, MAX_CONCURRENT_REQUESTS, asset => processAsset(asset,"US",fetchUSData));
   }
   if (shouldScanLSE()) {
-    await mapWithConcurrency(LSE_POOL, MAX_CONCURRENT_REQUESTS, asset => processAsset(asset,"LSE",fetchLSEData));
+    await mapWithConcurrency(LSE_POOL, MAX_CONCURRENT_REQUESTS, asset => processAsset(asset,"LSE", sym => withTimeout(fetchLSEData(sym), 8000, "lse").catch(() => null)));
   }
 
   log(`⏱ scan done in ${((Date.now() - scanProgress.t0) / 1000).toFixed(0)}s | ${_timings.length} assets | slowest: ${[..._timings].sort((a, b) => b[1] - a[1]).slice(0, 4).map(x => `${x[0]} ${(x[1] / 1000).toFixed(1)}s`).join(", ")}`);
@@ -8047,7 +8051,17 @@ async function safeCycle() {
     // (sendRejectStatsSummary, at US close) now carries real diagnostic
     // insight instead, so the hourly version was redundant noise.
     // sendHourlyRejectSummary() left defined, just unused.
-    const signals = await withTimeout(safeRun("scan", scan), SCAN_TIMEOUT_MS, "scan");
+    let signals;
+    try {
+      signals = await withTimeout(safeRun("scan", scan), SCAN_TIMEOUT_MS, "scan");
+    } catch (e) {
+      if (!/Timeout: scan/.test(String(e?.message || e))) throw e;
+      const d = scanProgress.done;
+      log(`⏱ scan timed out after ${((Date.now() - scanProgress.t0) / 1000).toFixed(0)}s | finished ${d.length} assets | slowest: ${[...d].sort((a, b) => b[1] - a[1]).slice(0, 4).map(x => `${x[0]} ${(x[1] / 1000).toFixed(1)}s`).join(", ")} -- using the ${scanProgress.results.length} signal(s) found so far`);
+      const partial = scanProgress.results.slice();
+      scanProgress = { ...scanProgress, aborted: true, results: [] }; // new object identity => the stale scan stops at its next asset
+      signals = partial.length ? pickTopSignals(partial) : [];
+    }
     await safeRun("flushRejectDiagnostics", flushRejectDiagnostics);
     await safeRun("safetyModeAlert", sendSafetyModeAlert);
     if (Array.isArray(signals) && signals.length > 0) {
@@ -8139,7 +8153,10 @@ const PICKER_ENABLED      = process.env.PICKER_ENABLED !== "0";
 const PICKER_STATE_FILE   = path.join(DATA_DIR, "picker_state.json");
 const PICKER_RUN_UK_HOUR  = Number(process.env.PICKER_RUN_UK_HOUR || 21); // after US close (21:00 UK in BST)
 const PICKER_RUN_UK_MIN   = Number(process.env.PICKER_RUN_UK_MIN  || 30);
-const PICKER_MAX_PICKS    = 2;
+const PICKER_MAX_PICKS_DEFAULT = Math.max(1, Number(process.env.PICKER_MAX_PICKS || 5)); // total open positions
+const PICKER_MAX_STOCK    = Number(process.env.PICKER_MAX_STOCK  || 3);  // class caps: stocks / coins are each correlated within their class
+const PICKER_MAX_CRYPTO   = Number(process.env.PICKER_MAX_CRYPTO || 2);
+let pickerMaxPicks = PICKER_MAX_PICKS_DEFAULT; // mutable only so the backtest can compare 2 / 4 / 5 (it restores the default)
 const PICKER_STOP_ATR     = 2.5;   // initial stop = close - 2.5 x ATR14
 const PICKER_SWAP_MARGIN  = 1.25;  // challenger must beat a held pick's score by 25% to force a rotation
 const PICKER_MAX_EXT_SMA20 = 1.18; // skip assets >18% above SMA20 (don't chase)
@@ -8279,32 +8296,48 @@ function pickerChoose(ranked, held, scoresBySym) {
   const keep = [];
   for (const h of held) {
     const cur = scoresBySym[h.sym];
-    if (!cur) continue;                               // no data -> treat as exit
+    if (!cur) {                                       // no fresh data today: do NOT assume an exit (a data outage must not close positions); give up after 3 missed days
+      const miss = (h.missDays || 0) + 1;
+      if (miss < 3) keep.push({ ...h, missDays: miss });
+      continue;
+    }
     if (cur.price <= h.stop) continue;                // stopped
     if (!(cur.price > cur.sma50)) continue;           // trend broke
-    keep.push(h);
+    keep.push({ ...h, missDays: 0 });
   }
   const picks = keep.map(h => ({ ...h, kept: true }));
   const top = ranked.filter(r => r.ok);
-  // rotation: a challenger far ahead of the weakest held pick replaces it
-  if (picks.length >= PICKER_MAX_PICKS && top.length) {
+  const capFor = cls => (cls === "crypto" ? PICKER_MAX_CRYPTO : PICKER_MAX_STOCK);
+  const countOf = (arr, cls) => arr.filter(p => p.cls === cls).length;
+  // rotation: a challenger far ahead of the weakest held pick replaces it (only if the class caps would still allow it)
+  if (picks.length >= pickerMaxPicks && top.length) {
     const worst = picks.reduce((a, b) => ((scoresBySym[a.sym]?.score ?? 0) <= (scoresBySym[b.sym]?.score ?? 0) ? a : b));
     const wScore = scoresBySym[worst.sym]?.score ?? 0;
     const chall = top.find(t => !picks.some(p => p.sym === t.sym));
-    if (chall && chall.score > wScore * PICKER_SWAP_MARGIN) { picks.splice(picks.indexOf(worst), 1); }
-  }
-  for (const t of top) {
-    if (picks.length >= PICKER_MAX_PICKS) break;
-    if (picks.some(p => p.sym === t.sym)) continue;
-    // prefer diversification: if we already hold one of this class and the other class has a decent candidate, defer
-    const sameClass = picks.filter(p => p.cls === t.cls).length;
-    if (sameClass >= 1) {
-      const alt = top.find(x => x.cls !== t.cls && !picks.some(p => p.sym === x.sym) && x.score >= t.score * 0.7);
-      if (alt) continue;
+    if (chall && chall.score > wScore * PICKER_SWAP_MARGIN) {
+      const rest = picks.filter(p => p !== worst);
+      if (countOf(rest, chall.cls) < capFor(chall.cls)) picks.splice(picks.indexOf(worst), 1);
     }
-    picks.push({ sym: t.sym, cls: t.cls, entryPrice: t.price, entryAt: new Date().toISOString(), stop: t.stop, entryScore: t.score, kept: false });
   }
-  return picks.slice(0, PICKER_MAX_PICKS);
+  const deferred = [];
+  const entry = t => picks.push({ sym: t.sym, cls: t.cls, entryPrice: t.price, entryAt: new Date().toISOString(), stop: t.stop, entryScore: t.score, kept: false });
+  for (const t of top) {
+    if (picks.length >= pickerMaxPicks) break;
+    if (picks.some(p => p.sym === t.sym)) continue;
+    if (countOf(picks, t.cls) >= capFor(t.cls)) continue;
+    // prefer diversification early on: with one of this class already held and a decent other-class candidate available, defer (revisited below if slots stay empty)
+    if (picks.length < 2 && countOf(picks, t.cls) >= 1) {
+      const alt = top.find(x => x.cls !== t.cls && !picks.some(p => p.sym === x.sym) && x.score >= t.score * 0.7);
+      if (alt) { deferred.push(t); continue; }
+    }
+    entry(t);
+  }
+  for (const t of deferred) {
+    if (picks.length >= pickerMaxPicks) break;
+    if (picks.some(p => p.sym === t.sym) || countOf(picks, t.cls) >= capFor(t.cls)) continue;
+    entry(t);
+  }
+  return picks.slice(0, pickerMaxPicks);
 }
 
 function pkFmt(n) { return n >= 100 ? n.toFixed(2) : n >= 1 ? n.toFixed(3) : n.toPrecision(4); }
@@ -8548,6 +8581,7 @@ async function sendWeeklyReview(ctx) {
   }
 
   if (grinders) { L.push(...pickerGrindersLines(grinders)); L.push(""); }
+  try { L.push(...persistShadowLines(bySym)); L.push(""); } catch { /* optional */ }
   try { const gsl = await grindShadowSummaryLines(); if (gsl.length) { L.push(...gsl); L.push(""); } } catch { /* optional */ }
 
   // scorecard
@@ -8579,10 +8613,12 @@ async function sendWeeklyReview(ctx) {
 // stops, equal weight across holdings like the live NAV. Intel tilt is OFF (no historical intel).
 // What it is NOT: a reconstruction of what the bot did in April, and it carries survivorship bias --
 // the universe is today's lists (plus INJ, NEAR, QNT, MRNA), so names that dropped out are missing.
+// Bump this when the backtest's content changes: it then posts once on the next deploy, never on every restart.
+const BACKTEST_VERSION = "v3-positions";
 async function runPickerBacktest() {
   try {
     if (!pickerLoadState()) await pickerLoadStateRemote();
-    if (pickerState.backtestDoneAt && process.env.PICKER_BACKTEST !== "rerun") { log(`🧪 BACKTEST already posted ${pickerState.backtestDoneAt} -- skipping (set PICKER_BACKTEST=rerun to repeat)`); return; }
+    if (pickerState.backtestVersion === BACKTEST_VERSION && process.env.PICKER_BACKTEST !== "force") { log(`🧪 BACKTEST ${BACKTEST_VERSION} already posted ${pickerState.backtestDoneAt} -- skipping (set PICKER_BACKTEST=force to repeat)`); return; }
     const startStr = process.env.BACKTEST_START || "2026-04-01";
     const startT = new Date(`${startStr}T00:00:00Z`).getTime();
     const daysBack = Math.ceil((Date.now() - startT) / 86400000) + 300;
@@ -8596,15 +8632,16 @@ async function runPickerBacktest() {
     const idxAt = (bars, t) => { let lo = 0, hi = bars.length - 1, r = -1; while (lo <= hi) { const m = (lo + hi) >> 1; if (bars[m].t <= t) { r = m; lo = m + 1; } else hi = m - 1; } return r; };
     const spyAll = sb["SPY"] || [], btcAll = cb["BTCUSDT"] || [];
     if (!spyAll.length || !btcAll.length) { await sendBoth("🧪 Backtest could not run: no SPY/BTC history returned.", "status"); return; }
-    pickerTiltOff = true;
-    let nav = 1, peak = 1, mdd = 0, held = [], pending = null;
-    const trades = [], navCurve = [];
     const CASES = ["INJUSDT", "NEARUSDT", "QNTUSDT", "MRNA"];
-    const diag = Object.fromEntries(CASES.map(c => [c, {}]));
-    const allWhy = {}; let regDays = { n: 0, stock: 0, crypto: 0 };
     const dayEnd = t => t + DAY - 1;
     const end = btcAll[btcAll.length - 1].t;
     const barOn = (sym, d) => { const a = all[sym]; if (!a) return null; const i = idxAt(a.bars, d); return i >= 0 && a.bars[i].t >= d - 4 * DAY ? { b: a.bars[i], i, same: a.bars[i].t >= d } : null; };
+    const sim = (maxPicks) => { // synchronous (no awaits), so it cannot interleave with the live picker
+    pickerMaxPicks = maxPicks; pickerTiltOff = true;
+    let nav = 1, peak = 1, mdd = 0, held = [], pending = null;
+    const trades = [], navCurve = [];
+    const diag = Object.fromEntries(CASES.map(c => [c, {}]));
+    const allWhy = {}; let regDays = { n: 0, stock: 0, crypto: 0 };
     for (let d = Math.floor(startT / DAY) * DAY; d <= end; d += DAY) {
       // 1) fills from yesterday's decisions, at today's open
       const fills = [];
@@ -8664,8 +8701,8 @@ async function runPickerBacktest() {
       }
       const bySym = Object.fromEntries(scores.filter(s => s.price).map(s => [s.sym, s]));
       const ranked = scores.filter(s => s.ok).sort((a, b) => b.score - a.score);
-      const picks = pickerChoose(ranked, held.map(h => ({ sym: h.sym, cls: h.cls, stop: h.stop })), bySym);
-      for (const pk of picks) { const h = held.find(x => x.sym === pk.sym); const cur = bySym[pk.sym]; if (h && cur) h.stop = Math.max(h.stop, cur.stop); }
+      const picks = pickerChoose(ranked, held.map(h => ({ sym: h.sym, cls: h.cls, stop: h.stop, missDays: h.missDays || 0 })), bySym);
+      for (const pk of picks) { const h = held.find(x => x.sym === pk.sym); const cur = bySym[pk.sym]; if (h) h.missDays = pk.missDays || 0; if (h && cur) h.stop = Math.max(h.stop, cur.stop); }
       const exit = held.filter(h => !picks.some(p => p.sym === h.sym)).map(h => h.sym);
       const why = {};
       for (const sym of exit) { const c = bySym[sym]; why[sym] = !c ? "no data" : c.price <= (held.find(x => x.sym === sym)?.stop ?? 0) ? "stop (close)" : !(c.price > c.sma50) ? "closed below 50-day" : "replaced by stronger"; }
@@ -8673,6 +8710,13 @@ async function runPickerBacktest() {
       if (exit.length || enter.length) pending = { exit, enter, why };
     }
     pickerTiltOff = false;
+    return { nav, mdd, held, trades, diag, allWhy, regDays };
+    };
+    const BT_CONFIGS = [...new Set([2, 4, 5, PICKER_MAX_PICKS_DEFAULT])].sort((a, b) => a - b);
+    const runs = {};
+    for (const m of BT_CONFIGS) runs[m] = sim(m);
+    pickerMaxPicks = PICKER_MAX_PICKS_DEFAULT;
+    const { nav, mdd, held, trades, diag, allWhy, regDays } = runs[PICKER_MAX_PICKS_DEFAULT];
     // close out anything still open at the last bar for reporting
     const open = held.map(h => { const o = barOn(h.sym, end); return { sym: h.sym, cls: h.cls, entryT: h.entryT, ret: o ? o.b.c / h.entryPx - 1 : null }; });
     const f = x => (x == null ? "n/a" : `${x >= 0 ? "+" : ""}${(x * 100).toFixed(1)}%`);
@@ -8685,6 +8729,9 @@ async function runPickerBacktest() {
     L.push("");
     L.push(`Strategy: <b>${f(nav - 1)}</b> · SPY ${f(bh(spyAll))} · BTC ${f(bh(btcAll))} · max drawdown ${f(mdd)}`);
     L.push(`Closed trades ${trades.length} (win rate ${trades.length ? Math.round((wins / trades.length) * 100) : 0}%, avg ${f(trades.length ? trades.reduce((a, t) => a + t.ret, 0) / trades.length : null)}) · open now ${open.length}`);
+    L.push("");
+    L.push(`<b>By number of open positions</b> (same rules, same data; live setting = ${PICKER_MAX_PICKS_DEFAULT}, max ${PICKER_MAX_STOCK} stocks / ${PICKER_MAX_CRYPTO} coins)`);
+    for (const m of BT_CONFIGS) { const r = runs[m]; const w = r.trades.filter(t => t.ret > 0).length; L.push(`${m} max: ${f(r.nav - 1)} · max drawdown ${f(r.mdd)} · ${r.trades.length} closed trades (${r.trades.length ? Math.round((w / r.trades.length) * 100) : 0}% won)`); }
     L.push("");
     L.push("<b>Case studies</b>");
     for (const sym of ["INJUSDT", "NEARUSDT", "QNTUSDT", "MRNA"]) {
@@ -8704,13 +8751,14 @@ async function runPickerBacktest() {
     L.push("<b>Worst 5 trades</b>: " + (sorted.slice(0, 5).map(t => `${t.sym.replace("USDT", "")} ${f(t.ret)}`).join(", ") || "none"));
     L.push("<b>Best 5 trades</b>: " + (sorted.slice(-5).reverse().map(t => `${t.sym.replace("USDT", "")} ${f(t.ret)}`).join(", ") || "none"));
     L.push("");
-    L.push(`<i>Earnings filter and Intel tilt not replayed. It posts once only; set PICKER_BACKTEST=rerun to repeat.</i>`);
+    L.push(`<i>Earnings filter and Intel tilt not replayed. It posts once per version; set PICKER_BACKTEST=force to repeat.</i>`);
     await sendBoth(L.join("\n"), "status");
     pickerState.backtestDoneAt = new Date().toISOString();
+    pickerState.backtestVersion = BACKTEST_VERSION;
     await pickerSaveState();
     log(`🧪 BACKTEST done: ${trades.length} trades, nav ${nav.toFixed(3)}`);
   } catch (e) {
-    pickerTiltOff = false;
+    pickerTiltOff = false; pickerMaxPicks = PICKER_MAX_PICKS_DEFAULT;
     log(`🧪 BACKTEST ERROR: ${e.stack || e.message}`);
     await sendBoth(`🧪 Backtest failed: ${escapeHtml(e.message)}`, "status");
   }
@@ -8805,12 +8853,44 @@ function potdLines(p, stockReg, cryptoReg, held) {
     const isHeld = (held || []).some(h => h.sym === x.sym);
     const status = x.boostPct > 0 ? `🔥 <b>Day ${x.streak} at #1 — upgraded to POTENTIAL BUY</b>` : `Day ${x.streak} at #1 — watching (upgrade after ${POTD_BOOST_DAYS} days)`;
     L.push(`${label}: <b>${nm(x.sym)}</b> · ${pkFmt(x.price)} · ${status}${isHeld ? " · already a pick" : ""}`);
-    L.push(`   Points ${x.pts.toFixed(1)}${x.boostPct > 0 ? ` → <b>${x.boosted.toFixed(1)}</b> (+${x.boostPct}% persistence boost)` : ""} · 3m ${pc(x.r63)} vs ${x.benchName} ${pc(x.b63)} · ${pc(x.ext)} above 20-day · stop ${pkFmt(x.stop)} (${(x.riskPct * 100).toFixed(1)}% risk)`);
+    L.push(`   Points ${x.pts.toFixed(1)}${x.boostPct > 0 ? ` → <b>${x.boosted.toFixed(1)}</b> (+${x.boostPct}% persistence boost)` : ""} · 3m ${pc(x.r63)} vs ${x.benchName} ${pc(x.b63)} · ${pc(x.ext)} vs 20-day avg · stop ${pkFmt(x.stop)} (${(x.riskPct * 100).toFixed(1)}% risk)`);
   };
   row("📈 Stock", p.stock, stockReg);
   row("🪙 Coin", p.crypto, cryptoReg);
   L.push("");
   L.push(`<i>Staying at #1 for ${POTD_BOOST_DAYS}+ days is evidence the strength is persistent, not a one-day spike. The boost is a label and does not change the picker's buy/sell rules.</i>`);
+  return L;
+}
+
+// ── Persistence shadow test ──
+// Re-ranks the day's candidates with a small bonus for how many different weeks Intel flagged
+// the name (+5%/week, max +40%), and records who would be #1 vs who actually is. NOTHING is
+// traded or changed from this: it only builds the evidence to judge it in the weekly review.
+async function persistShadowRecord(ranked, bySym) {
+  const rows = await ledgerLoad();
+  if (!rows) return;
+  if (!Array.isArray(pickerState.persistShadow)) pickerState.persistShadow = [];
+  const today = getUkDateString();
+  pickerState.persistShadow = pickerState.persistShadow.filter(x => x.d !== today);
+  for (const cls of ["stock", "crypto"]) {
+    const pool = ranked.filter(r => r.cls === cls);
+    if (!pool.length) continue;
+    const w = r => Math.min(8, (rows.get(ledgerKey(r.cls, r.sym))?.intel_weeks || []).length);
+    const sh = [...pool].sort((a, b) => b.score * (1 + 0.05 * w(b)) - a.score * (1 + 0.05 * w(a)))[0];
+    pickerState.persistShadow.push({ d: today, cls, actual: pool[0].sym, actualPx: pool[0].price, shadow: sh.sym, shadowPx: sh.price, shadowWeeks: w(sh) });
+  }
+  if (pickerState.persistShadow.length > 400) pickerState.persistShadow = pickerState.persistShadow.slice(-400);
+}
+function persistShadowLines(bySym) {
+  const log_ = (pickerState.persistShadow || []).filter(x => bySym[x.actual] && bySym[x.shadow] && Date.now() - new Date(x.d).getTime() >= 5 * 86400000);
+  if (!log_.length) return ["🧪 <b>Persistence test</b> (shadow, changes nothing): collecting data — needs 5+ days per sample."];
+  const diff = log_.filter(x => x.actual !== x.shadow);
+  const ret = (sym, px) => bySym[sym].price / px - 1;
+  const A = avg(log_.map(x => ret(x.actual, x.actualPx))), S = avg(log_.map(x => ret(x.shadow, x.shadowPx)));
+  const pc = x => `${x >= 0 ? "+" : ""}${(x * 100).toFixed(1)}%`;
+  const L = [`🧪 <b>Persistence test</b> (shadow, changes nothing) — ${log_.length} daily samples, 5+ days old`];
+  L.push(`Today's #1 → avg return since: ${pc(A)} · Persistence-boosted #1 → ${pc(S)} · they disagreed on ${diff.length} of ${log_.length} days`);
+  if (log_.length < 30) L.push(`<i>Too few samples to conclude anything yet (need 30+ and several weeks).</i>`);
   return L;
 }
 
@@ -8822,6 +8902,20 @@ async function runPicker(reason = "scheduled") {
     const stockSyms = [...new Set([...PERFORMANCE_UNIVERSE_US, ...STOCK_POOL].filter(s => s && !s.includes(".")).concat(["SPY"]))]; // base universe + whatever the scanner's dynamic pool currently holds
     const cryptoSyms = [...new Set([...CRYPTO_PAIRS, "BTCUSDT"])];
     const [stockBars, cryptoBars] = await Promise.all([pickerFetchStockDaily(stockSyms), pickerFetchCryptoDaily(cryptoSyms)]);
+    // Today's still-forming daily stock bar must not be scored (it is only a partial day). Alpaca's daily bar starts at
+    // midnight New York; it is complete from about 16:15 New York. (Crypto's forming bar is already dropped at fetch.)
+    for (const bars of Object.values(stockBars)) { const lb = bars[bars.length - 1]; if (lb && Date.now() < lb.t + 16.25 * 3600 * 1000) bars.pop(); }
+    // Data-completeness guard: a feed outage must never look like "everything exited" or "market regime fine".
+    const gotS = Object.keys(stockBars).length, gotC = Object.keys(cryptoBars).length;
+    if (!(stockBars["SPY"]?.length) || !(cryptoBars["BTCUSDT"]?.length) || gotS < stockSyms.length * 0.6 || gotC < cryptoSyms.length * 0.6) {
+      log(`🧭 Picker skipped: price data incomplete (stocks ${gotS}/${stockSyms.length}, crypto ${gotC}/${cryptoSyms.length}, SPY ${stockBars["SPY"]?.length ? "ok" : "missing"}, BTC ${cryptoBars["BTCUSDT"]?.length ? "ok" : "missing"}) -- will retry`);
+      if (pickerState.dataWarnDate !== getUkDateString()) {
+        pickerState.dataWarnDate = getUkDateString();
+        await pickerSaveState();
+        await sendPrivate(`⚠️ <b>Picker skipped</b> — price data incomplete (stocks ${gotS}/${stockSyms.length}, crypto ${gotC}/${cryptoSyms.length}). No positions changed; it retries automatically.`, "status");
+      }
+      return;
+    }
     const spy = (stockBars["SPY"] || []).map(b => b.c);
     const btc = (cryptoBars["BTCUSDT"] || []).map(b => b.c);
     const stockReg = pickerRegime(spy), cryptoReg = pickerRegime(btc);
@@ -8884,6 +8978,7 @@ async function runPicker(reason = "scheduled") {
     pickerState.lastCash = picks.length === 0;
     let potd = null;
     try { if (POTD) potd = potdUpdate(ranked); } catch (e) { log(`⚠️ POTD failed: ${e.message}`); }
+    try { await persistShadowRecord(ranked, bySym); } catch (e) { log(`⚠️ Persist shadow failed: ${e.message}`); }
     await pickerSaveState();
     if (potd) await safeRun("potd", () => sendBoth(potdLines(potd, stockReg, cryptoReg, picks).join("\n"), "picks"));
     await ledgerPickerSync({ scores, bySym, picks, prevHeld, closedNow });
@@ -8989,12 +9084,36 @@ async function runPicker(reason = "scheduled") {
   } finally { pickerRunning = false; }
 }
 
+// One-shot fresh start: set PICKER_RESET to any new token in Railway. The old state is archived first
+// (picker_kv key state_archive_<token>); if the archive cannot be saved, nothing is reset.
+async function pickerMaybeReset() {
+  const tok = process.env.PICKER_RESET;
+  if (!tok || pickerState.resetToken === tok) return;
+  try {
+    if (supabaseEnabled) {
+      const { error } = await supabase.from("picker_kv").upsert({ key: `state_archive_${tok}`, value: pickerState, updated_at: new Date().toISOString() }, { onConflict: "key" });
+      if (error) throw new Error(error.message);
+    } else {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      fs.writeFileSync(`${PICKER_STATE_FILE}.archive_${tok}`, JSON.stringify(pickerState));
+    }
+    const old = pickerState;
+    pickerState = { ...old, holdings: [], closed: [], nav: [], events: [], topLog: [], lastRunDate: "", startedAt: null, lastCash: false, resetToken: tok };
+    await pickerSaveState();
+    log(`🧭 Picker RESET (${tok}): archived ${old.holdings?.length || 0} holding(s), ${old.closed?.length || 0} closed trade(s); starting fresh`);
+  } catch (e) {
+    log(`🧭 Picker reset NOT done (archive failed): ${e.message}`);
+    await sendPrivate(`⚠️ <b>Picker reset not done</b> — could not archive the old state (${escapeHtml(e.message)}). Nothing was changed.`, "status");
+  }
+}
+
 function startPicker() {
   if (!PICKER_ENABLED) { log("🧭 Picker disabled (PICKER_ENABLED=0)"); return; }
   const had = pickerLoadState();
-  if (process.env.PICKER_BACKTEST === "1" || process.env.PICKER_BACKTEST === "rerun") setTimeout(() => void runPickerBacktest(), 120 * 1000);
+  if (["1", "rerun", "force"].includes(process.env.PICKER_BACKTEST)) setTimeout(() => void runPickerBacktest(), 120 * 1000);
   void (async () => {
     if (!had) await pickerLoadStateRemote();
+    await pickerMaybeReset();
     const first = !pickerState.lastRunDate;
     if (first) setTimeout(() => void runPicker("first-run"), 90 * 1000); // let the scanner settle, then preview
     setInterval(() => {
