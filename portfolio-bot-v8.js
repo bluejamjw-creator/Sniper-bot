@@ -1,5 +1,5 @@
 /**
- * portfolio-bot-v8.js — HUNTER V15 🏹
+ * portfolio-bot-v8.js — HUNTER V15.1 🏹
  *
  * Built on V14.2 (unchanged: scoring, universe, Revolut filter, learning,
  * late-entry veto, -14% / +20% bracket). Changes, each switchable:
@@ -20,6 +20,10 @@
  *    alert only when 2+ of them buy a coin that is on Revolut. Everything
  *    else is tracked silently for the weekly evidence report.
  *    Turn off with FOMO_WATCH=off.
+ * 5. SECTOR DATA (V15.1) — each snapshot also records the coin's CoinGecko
+ *    sector, that sector's 24h strength and rank, and the coin's market cap.
+ *    Evidence only: scoring is unchanged until the data shows it helps.
+ *    Needs cg_* columns on hunter_v11_snapshots. HUNTER_SECTOR_DATA=off disables.
  */
 /**
  * portfolio-bot-v8.js — PART 1 of 3
@@ -804,6 +808,11 @@ const CONFIG = {
   researchStatsEnabled: process.env.HUNTER_RESEARCH_STATS === 'true',
   // V15: drawdown-first labels (needs the two new columns; HUNTER_DD_LABELS=off to disable).
   drawdownLabels: process.env.HUNTER_DD_LABELS !== 'off',
+  // V15.1: CoinGecko sector + market cap recorded on snapshots (evidence only).
+  sectorDataEnabled: process.env.HUNTER_SECTOR_DATA !== 'off',
+  sectorCoinsRefreshMs: 24 * 3600 * 1000,
+  sectorChangeRefreshMs: 4 * 3600 * 1000,
+  sectorDailyCallCap: 60,
   eodReportHourUtc: 20, // 20:00 UTC = 21:00 BST / 20:00 GMT
   learningModelRefreshMs: 6 * 60 * 60 * 1000,
 
@@ -1846,6 +1855,146 @@ async function alertUser(text) {
     return;
   }
   console.warn('[HUNTER] No Discord webhook set (DISCORD_WEBHOOK_HUNTER / DISCORD_WEBHOOK_URL) — alert only logged:\n' + text);
+}
+
+// ----------------------------- Sector data (V15.1) -----------------------------
+// Records each coin's CoinGecko sector and market cap on every snapshot, for
+// evidence only: nothing here changes scoring or opens. After a few weeks the
+// outcome data shows whether coins in leading sectors really do better.
+// Budget: ~20 CoinGecko calls/day (free Demo plan allows 10,000/month).
+const SECTOR_PRIORITY = [
+  // Most specific first: a coin in several sectors is filed under the first match.
+  ['artificial-intelligence', 'AI'],
+  ['depin', 'DePIN'],
+  ['real-world-assets-rwa', 'RWA'],
+  ['meme-token', 'Meme'],
+  ['gaming', 'Gaming'],
+  ['privacy-coins', 'Privacy'],
+  ['oracle', 'Oracle'],
+  ['zero-knowledge-zk', 'ZK'],
+  ['layer-2', 'Layer 2'],
+  ['decentralized-exchange', 'DEX'],
+  ['decentralized-finance-defi', 'DeFi'],
+  ['storage', 'Storage'],
+  ['exchange-based-tokens', 'Exchange'],
+  ['metaverse', 'Metaverse'],
+  ['layer-1', 'Layer 1'],
+];
+
+const SECTORS = {
+  coins: new Map(),      // BASE -> { sector, mcap, mcapRank }
+  sectorChange: new Map(), // sector label -> 24h market-cap change %
+  sectorRank: new Map(),   // sector label -> rank by 24h change (1 = strongest)
+  coinsAt: 0,
+  changeAt: 0,
+  mode: null,             // 'demo' | 'pro' | 'public' — whichever works with the key
+  callsToday: 0,
+  callsDay: '',
+  running: false,
+};
+
+async function coingecko(path) {
+  const day = new Date().toISOString().slice(0, 10);
+  if (SECTORS.callsDay !== day) { SECTORS.callsDay = day; SECTORS.callsToday = 0; }
+  if (SECTORS.callsToday >= CONFIG.sectorDailyCallCap) throw new Error('daily CoinGecko cap reached');
+  const key = ENV.COINGECKO_API_KEY;
+  const tries = SECTORS.mode
+    ? [SECTORS.mode]
+    : (key ? ['demo', 'pro', 'public'] : ['public']);
+  let lastError;
+  for (const mode of tries) {
+    const base = mode === 'pro' ? 'https://pro-api.coingecko.com' : 'https://api.coingecko.com';
+    const headers = mode === 'demo' ? { 'x-cg-demo-api-key': key } : mode === 'pro' ? { 'x-cg-pro-api-key': key } : {};
+    SECTORS.callsToday++;
+    try {
+      const res = await fetch(base + path, { headers: { Accept: 'application/json', ...headers }, signal: AbortSignal.timeout(20000) });
+      if (res.ok) { SECTORS.mode = mode; return await res.json(); }
+      lastError = new Error(`CoinGecko ${mode} ${res.status}`);
+      if (res.status === 429) break; // rate limited: try again next cycle
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error('CoinGecko unavailable');
+}
+
+async function refreshSectorData() {
+  if (!CONFIG.sectorDataEnabled || SECTORS.running) return;
+  const now = Date.now();
+  const needCoins = now - SECTORS.coinsAt >= CONFIG.sectorCoinsRefreshMs;
+  const needChange = now - SECTORS.changeAt >= CONFIG.sectorChangeRefreshMs;
+  if (!needCoins && !needChange) return;
+  SECTORS.running = true;
+  try {
+    if (needCoins) {
+      const coins = new Map();
+      // Market cap and rank for the top 500 coins (2 calls).
+      for (const page of [1, 2]) {
+        const rows = await coingecko(`/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=${page}`);
+        for (const r of Array.isArray(rows) ? rows : []) {
+          const base = String(r.symbol || '').toUpperCase();
+          if (!base || coins.has(base)) continue; // first = biggest coin with that ticker
+          coins.set(base, { sector: null, mcap: num(r.market_cap, null), mcapRank: num(r.market_cap_rank, null), id: r.id });
+        }
+      }
+      // Sector membership (one call per sector). Least specific sectors are applied last.
+      for (const [id, label] of SECTOR_PRIORITY) {
+        let rows;
+        try {
+          rows = await coingecko(`/api/v3/coins/markets?vs_currency=usd&category=${encodeURIComponent(id)}&order=market_cap_desc&per_page=250&page=1`);
+        } catch (error) {
+          console.log(`[SECTORS] ${label} skipped: ${error.message}`);
+          continue;
+        }
+        for (const r of Array.isArray(rows) ? rows : []) {
+          const base = String(r.symbol || '').toUpperCase();
+          const c = coins.get(base);
+          if (c && c.id === r.id && !c.sector) c.sector = label;
+          // Smaller coins outside the top 500 still get their sector and size.
+          if (!c && base) coins.set(base, { sector: label, mcap: num(r.market_cap, null), mcapRank: num(r.market_cap_rank, null), id: r.id });
+        }
+        await sleep(2500); // stay well under the per-minute limit
+      }
+      SECTORS.coins = coins;
+      SECTORS.coinsAt = now;
+      const tagged = [...coins.values()].filter(c => c.sector).length;
+      console.log(`[SECTORS] ${coins.size} coins with market cap, ${tagged} with a sector (CoinGecko ${SECTORS.mode}, ${SECTORS.callsToday} calls today)`);
+    }
+    if (needChange || needCoins) {
+      const cats = await coingecko('/api/v3/coins/categories');
+      const byId = new Map((Array.isArray(cats) ? cats : []).map(c => [c.id, num(c.market_cap_change_24h, null)]));
+      const change = new Map();
+      for (const [id, label] of SECTOR_PRIORITY) if (byId.get(id) != null) change.set(label, byId.get(id));
+      const ranked = [...change.entries()].sort((a, b) => b[1] - a[1]);
+      SECTORS.sectorChange = change;
+      SECTORS.sectorRank = new Map(ranked.map(([label], i) => [label, i + 1]));
+      SECTORS.changeAt = now;
+      if (ranked.length) {
+        console.log(`[SECTORS] leading 24h: ${ranked.slice(0, 3).map(([l, v]) => `${l} ${v >= 0 ? '+' : ''}${v.toFixed(1)}%`).join(', ')}`);
+      }
+    }
+  } catch (error) {
+    console.log(`[SECTORS] refresh failed (scoring unaffected): ${error.message}`);
+    // Back off so a failing API is not retried every cycle.
+    if (!SECTORS.coinsAt) SECTORS.coinsAt = now - CONFIG.sectorCoinsRefreshMs + 3600000;
+    SECTORS.changeAt = now;
+  } finally {
+    SECTORS.running = false;
+  }
+}
+
+// Fields recorded on each snapshot (null when unknown).
+function sectorFields(symbol) {
+  if (!CONFIG.sectorDataEnabled) return {};
+  const c = SECTORS.coins.get(baseSymbol(symbol));
+  const sector = c ? c.sector : null;
+  return {
+    cg_sector: sector,
+    cg_sector_chg24h: sector != null && SECTORS.sectorChange.has(sector) ? round(SECTORS.sectorChange.get(sector), 4) : null,
+    cg_sector_rank: sector != null && SECTORS.sectorRank.has(sector) ? SECTORS.sectorRank.get(sector) : null,
+    cg_mcap: c && c.mcap != null ? c.mcap : null,
+    cg_mcap_rank: c && c.mcapRank != null ? c.mcapRank : null,
+  };
 }
 
 // ----------------------------- Market discovery -----------------------------
@@ -3791,6 +3940,9 @@ async function saveSnapshot(
 
       detection_mode:
         mode,
+
+      // V15.1: sector and market cap (evidence only, not scored)
+      ...sectorFields(asset.symbol),
     },
     'symbol,timestamp',
     'id'
@@ -7117,6 +7269,9 @@ async function runCycle() {
     const universe =
       await refreshUniverse();
 
+    // V15.1: refresh sector data in the background (never delays the scan).
+    refreshSectorData().catch(() => {});
+
     const btcCandles =
       await getBtcCandles();
 
@@ -8078,7 +8233,7 @@ async function startup() {
   );
 
   console.log(
-    'HUNTER V15 — CRYPTO EARLY-MOVE LEARNING ENGINE'
+    'HUNTER V15.1 — CRYPTO EARLY-MOVE LEARNING ENGINE'
   );
 
   console.log(
