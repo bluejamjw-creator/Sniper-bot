@@ -1,5 +1,5 @@
 /**
- * portfolio-bot-v8.js — HUNTER V15.1 🏹
+ * portfolio-bot-v8.js — HUNTER V15.2 🏹
  *
  * Built on V14.2 (unchanged: scoring, universe, Revolut filter, learning,
  * late-entry veto, -14% / +20% bracket). Changes, each switchable:
@@ -24,6 +24,10 @@
  *    sector, that sector's 24h strength and rank, and the coin's market cap.
  *    Evidence only: scoring is unchanged until the data shows it helps.
  *    Needs cg_* columns on hunter_v11_snapshots. HUNTER_SECTOR_DATA=off disables.
+ * 6. YIELD REGIME (V15.2) — each snapshot also records the US 10-year yield,
+ *    its change over 20 trading days and a tag: RISING (≥ +0.15 pts),
+ *    FALLING (≤ -0.15 pts) or FLAT. Background context only, never scored.
+ *    Needs us10y / us10y_chg20d / yield_regime columns. HUNTER_YIELD_REGIME=off disables.
  */
 /**
  * portfolio-bot-v8.js — PART 1 of 3
@@ -813,6 +817,10 @@ const CONFIG = {
   sectorCoinsRefreshMs: 24 * 3600 * 1000,
   sectorChangeRefreshMs: 4 * 3600 * 1000,
   sectorDailyCallCap: 60,
+  // V15.2: 10-year yield regime tag (evidence only). Band = pts over 20 trading days.
+  yieldRegimeEnabled: process.env.HUNTER_YIELD_REGIME !== 'off',
+  yieldRegimeBand: 0.15,
+  yieldRefreshMs: 12 * 3600 * 1000,
   eodReportHourUtc: 20, // 20:00 UTC = 21:00 BST / 20:00 GMT
   learningModelRefreshMs: 6 * 60 * 60 * 1000,
 
@@ -1995,6 +2003,80 @@ function sectorFields(symbol) {
     cg_mcap: c && c.mcap != null ? c.mcap : null,
     cg_mcap_rank: c && c.mcapRank != null ? c.mcapRank : null,
   };
+}
+
+// ----------------------------- Yield regime (V15.2) -----------------------------
+// Tags every snapshot with the US 10-year Treasury yield's trend: RISING,
+// FALLING or FLAT over the last 20 trading days (~1 month). Background context
+// only — never a buy signal and never scored. After a few months the outcome
+// data shows whether the tag improves picks; if not, it gets dropped.
+// Source: Alpha Vantage (1 call per refresh; free plan = 25/day), FMP fallback.
+const MACRO = { at: 0, us10y: null, chg20d: null, regime: null, asOf: null, source: null, running: false };
+
+function classifyYieldTrend(series) {
+  // series: [{ date, value }] newest first, values in percent
+  const clean = series.filter(p => Number.isFinite(p.value));
+  if (clean.length < 21) return null;
+  const now = clean[0].value;
+  const then = clean[20].value;
+  const chg = now - then; // percentage points over 20 trading days
+  const regime = chg >= CONFIG.yieldRegimeBand ? 'RISING'
+    : chg <= -CONFIG.yieldRegimeBand ? 'FALLING' : 'FLAT';
+  return { us10y: now, chg20d: chg, regime, asOf: clean[0].date };
+}
+
+async function fetchYieldSeries() {
+  const av = process.env.ALPHA_VANTAGE_API_KEY;
+  if (av) {
+    try {
+      const res = await fetch(`https://www.alphavantage.co/query?function=TREASURY_YIELD&interval=daily&maturity=10year&apikey=${encodeURIComponent(av)}`, { signal: AbortSignal.timeout(30000) });
+      const json = await res.json();
+      if (Array.isArray(json && json.data)) {
+        return { source: 'AlphaVantage', series: json.data.slice(0, 60).map(r => ({ date: r.date, value: Number(r.value) })) };
+      }
+      console.log(`[MACRO] Alpha Vantage gave no data: ${JSON.stringify(json).slice(0, 120)}`);
+    } catch (error) {
+      console.log(`[MACRO] Alpha Vantage failed: ${error.message}`);
+    }
+  }
+  const fmp = process.env.FMP_API_KEY;
+  if (fmp) {
+    try {
+      const to = new Date().toISOString().slice(0, 10);
+      const from = new Date(Date.now() - 60 * 86400000).toISOString().slice(0, 10);
+      const res = await fetch(`https://financialmodelingprep.com/stable/treasury-rates?from=${from}&to=${to}&apikey=${encodeURIComponent(fmp)}`, { signal: AbortSignal.timeout(30000) });
+      const json = await res.json();
+      if (Array.isArray(json)) {
+        const series = json.map(r => ({ date: r.date, value: Number(r.year10) }))
+          .sort((a, b) => String(b.date).localeCompare(String(a.date)));
+        return { source: 'FMP', series };
+      }
+    } catch (error) {
+      console.log(`[MACRO] FMP failed: ${error.message}`);
+    }
+  }
+  return null;
+}
+
+async function refreshYieldRegime() {
+  if (!CONFIG.yieldRegimeEnabled || MACRO.running) return;
+  if (Date.now() - MACRO.at < CONFIG.yieldRefreshMs) return;
+  MACRO.running = true;
+  MACRO.at = Date.now(); // also on failure: retry next refresh window, not every cycle
+  try {
+    const got = await fetchYieldSeries();
+    const r = got && classifyYieldTrend(got.series);
+    if (!r) { console.log('[MACRO] 10y yield unavailable; regime tag left blank (scoring unaffected)'); return; }
+    Object.assign(MACRO, r, { source: got.source });
+    console.log(`[MACRO] US 10y ${r.us10y.toFixed(2)}% (${r.chg20d >= 0 ? '+' : ''}${r.chg20d.toFixed(2)} pts over 20 days) → ${r.regime} · ${got.source} ${r.asOf}`);
+  } finally {
+    MACRO.running = false;
+  }
+}
+
+function macroFields() {
+  if (!CONFIG.yieldRegimeEnabled || !MACRO.regime) return {};
+  return { us10y: MACRO.us10y, us10y_chg20d: round(MACRO.chg20d, 4), yield_regime: MACRO.regime };
 }
 
 // ----------------------------- Market discovery -----------------------------
@@ -3943,6 +4025,8 @@ async function saveSnapshot(
 
       // V15.1: sector and market cap (evidence only, not scored)
       ...sectorFields(asset.symbol),
+      // V15.2: 10-year yield regime (evidence only, not scored)
+      ...macroFields(),
     },
     'symbol,timestamp',
     'id'
@@ -7271,6 +7355,7 @@ async function runCycle() {
 
     // V15.1: refresh sector data in the background (never delays the scan).
     refreshSectorData().catch(() => {});
+    refreshYieldRegime().catch(() => {});
 
     const btcCandles =
       await getBtcCandles();
@@ -8233,7 +8318,7 @@ async function startup() {
   );
 
   console.log(
-    'HUNTER V15.1 — CRYPTO EARLY-MOVE LEARNING ENGINE'
+    'HUNTER V15.2 — CRYPTO EARLY-MOVE LEARNING ENGINE'
   );
 
   console.log(

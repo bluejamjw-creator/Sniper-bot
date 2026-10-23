@@ -1192,6 +1192,13 @@ const PERFORMANCE_UNIVERSE_US = [...new Set([
 const HEAT_SCORES = new Map(); // asset → { score, lastUpdated, mentions }
 const HEAT_DECAY_MS = 8 * 60 * 60 * 1000; // heat decays over 8 hours
 const HEAT_HOT_THRESHOLD = 80; // above this = HOT ASSET
+// FIX C: leader-mode thresholds (Module 2 spec: heat >= 80 + vol >= 3x + momentum >= 5%)
+const LEADER_MIN_VOL_RATIO = Number(process.env.SNIPER_LEADER_MIN_VOL || 3.0);
+const LEADER_MIN_MOMENTUM  = Number(process.env.SNIPER_LEADER_MIN_MOM || 0.05);
+// FIX B: which passing setups fire, and how many
+const PICK_MIN_SCORE          = Number(process.env.SNIPER_PICK_MIN_SCORE || 85);   // 85 = A* grade
+const PICKS_PER_MARKET_SCAN   = Number(process.env.SNIPER_PICKS_PER_SCAN || 2);
+const MAX_SIGNALS_PER_MARKET_DAY = Number(process.env.SNIPER_MAX_PER_MARKET_DAY || 2);
 
 function addHeat(asset, points, reason) {
   const now = Date.now();
@@ -6366,7 +6373,14 @@ async function analyse(asset, candles, market, prefetchedQqqMom = null) {
     reject("poor_execution_severe", asset, market); return null;
   }
 
-  log(`✅ ${asset} ${market} ${setupType} score=${score} grade=${grade} execQ=${execQuality} hunter=${hunterScore}`);
+  // FIX C: Leader mode (Module 2) was documented and read in 3 places
+  // (No Regret entry reason, +10 opportunity rank, subscriber tag) but
+  // isLeader was never assigned, so it was always undefined. Spec from the
+  // header: heat >= 80 (intel/heat HOT) + volume >= 3x + momentum >= 5%.
+  const isLeader = getHeat(asset) >= HEAT_HOT_THRESHOLD && volRatio >= LEADER_MIN_VOL_RATIO && momentum >= LEADER_MIN_MOMENTUM;
+  if (isLeader) log(`👑 LEADER ${asset}: heat=${Math.round(getHeat(asset))} vol=${volRatio.toFixed(2)}x mom=${(momentum*100).toFixed(2)}%`);
+
+  log(`✅ ${asset} ${market} ${setupType} score=${score} grade=${grade} execQ=${execQuality} hunter=${hunterScore}${isLeader ? " LEADER" : ""}`);
 
   // FIX: sniper_signal_decisions had 168,000+ rows and every single one
   // was decision='REJECT' -- the diagnostic system was built entirely
@@ -6394,6 +6408,7 @@ async function analyse(asset, candles, market, prefetchedQqqMom = null) {
     breakoutDistance, atr, gapPct, emaDistPct,
     regime: market==="CRYPTO" ? btcTrend : market==="US" ? qqqTrend : "LSE_LOCAL",
     execOrderType, execEntryNote, execChaseLimit, execCancelCond, execQuality, hunterScore, convictionScore, combinedScore,
+    isLeader,
     structureScore: structureQuality.score,
     structureGrade: structureQuality.grade,
     structureFlags: structureQuality.flags,
@@ -6526,8 +6541,10 @@ function buildSignalMessage(signal, size) {
   const tp2 = signal.entry + (signal.entry - signal.sl) * 3;
   const tp2Pct = (((tp2 - signal.entry)/signal.entry)*100).toFixed(1);
 
+  const leaderTag = signal.isLeader ? `\n👑 <b>HOT LEADER</b> — heat, 3x+ volume and 5%+ momentum together` : "";
+
   return lines([
-    `🚨 ${gradeEmoji(signal.grade)} <b>${escapeHtml(signal.grade)} SETUP DETECTED</b>${ntag}${sniperTag}${grindTag}${regimeOverrideTag}`,
+    `🚨 ${gradeEmoji(signal.grade)} <b>${escapeHtml(signal.grade)} SETUP DETECTED</b>${ntag}${leaderTag}${sniperTag}${grindTag}${regimeOverrideTag}`,
     ``,
     `${marketEmoji(signal.market)} <b>${escapeHtml(signal.market)} | ${escapeHtml(sym)}</b>`,
     `${setupEmoji(signal.setupType)} ${escapeHtml(signal.setupType)}`,
@@ -6929,52 +6946,32 @@ function pickTopSignals(results) {
     if (top) log(`🏆 TOP ${m}: ${top.asset} score=${top.score} rank=${top.opportunityRank?.toFixed(0)}`);
   }
 
-  // V100: Dynamic elite threshold -- relative ranking beats absolute numbers
-  // "Is this clearly better than everything else today?"
-  // Best setup on a quiet day scores 91 and should fire. Hardcoded 110 would block it.
-  const allCandidates = [...(byMarket.US||[]), ...(byMarket.CRYPTO||[]), ...(byMarket.LSE||[])];
-  // FIX: was sorting/thresholding by hunterScore when present, but hunterScore
-  // is not a validated scale (HUNTER_GATE_ENABLED=false -- Hunter isn't trusted
-  // for eligibility yet) and isn't consistently comparable to the raw score's
-  // range. Confirmed real: a candidate with raw score 115 had hunterScore 18,
-  // got compared against threshold 55, and was wrongly rejected as no elite
-  // setup despite being a genuinely strong signal. score is the canonical
-  // metric everywhere else (MIN_GLOBAL_SCORE/MIN_CRYPTO_SCORE/MIN_US_SCORE
-  // all gate on score, never hunterScore) -- use it consistently here too.
-  allCandidates.sort((a,b) => (b.score||0) - (a.score||0));
-
-  const topScore    = allCandidates[0]?.score  ?? 0;
-  const secondScore = allCandidates[1]?.score  ?? 0;
-
-  // Dynamic threshold: must be clearly better than the field
-  // Minimum floor of 55 (multiplicative 55/100 = all components reasonable)
-  // Closes gap to second place must be 5+ points
-  const eliteThreshold = Math.max(55, secondScore + 5);
-  log(`🎯 Elite threshold: ${eliteThreshold.toFixed(0)} (top=${topScore.toFixed(0)} second=${secondScore.toFixed(0)})`);
-
-  // Global comparison: don't force market diversification
-  // If crypto has the 3 best opportunities, fire crypto. Market doesn't care about diversification.
-  const globalBest = allCandidates.filter(s =>
-    (s.hunterScore || s.score || 0) >= eliteThreshold
-  );
-
-  // One per market from the global best
-  const selected  = [];
-  const seenMarkets = new Set();
-  for (const s of globalBest) {
-    if (!seenMarkets.has(s.market)) {
-      selected.push(s);
-      seenMarkets.add(s.market);
-    }
+  // FIX A + B (V101.1). Two bugs here stopped good setups firing:
+  //  A) the filter compared (hunterScore || score) to the threshold.
+  //     hunterScore is a multiplied 0-100 product (typically 15-27), so it
+  //     was always below 55 -- live example: RBRK score 118, "ELITE", then
+  //     "NO ELITE SETUPS". Uses the canonical raw score now.
+  //  B) the threshold was max(55, second-best + 5), so whenever two strong
+  //     setups appeared together (118 and 115) neither could pass -- the
+  //     best day produced nothing. Now every setup that passed every gate and
+  //     scores A* (>= PICK_MIN_SCORE) fires, best opportunity rank first,
+  //     at most PICKS_PER_MARKET_SCAN per market per scan. processSignals()
+  //     still enforces position, pending, risk, dedup and daily caps.
+  const selected = [];
+  for (const m of Object.keys(byMarket)) {
+    const eligible = byMarket[m].filter(s => (s.score || 0) >= PICK_MIN_SCORE);
+    const below = byMarket[m].length - eligible.length;
+    if (below > 0) log(`🎯 ${m}: ${below} passing setup(s) below A* (${PICK_MIN_SCORE}) -- logged, not fired`);
+    selected.push(...eligible.slice(0, PICKS_PER_MARKET_SCAN));
   }
+  selected.sort((a, b) => (b.opportunityRank || 0) - (a.opportunityRank || 0));
 
   if (selected.length === 0) {
-    log("🚫 NO ELITE SETUPS -- all candidates below dynamic threshold");
+    log(`🚫 NO A* SETUPS -- nothing passed all gates at score >= ${PICK_MIN_SCORE}`);
   } else {
-    log(`✅ ELITE SETUPS: ${selected.map(s => s.asset + " (" + (s.hunterScore||s.score) + ")").join(", ")}`);
+    log(`✅ ELITE SETUPS: ${selected.map(s => `${s.asset} (score ${s.score}, rank ${Math.round(s.opportunityRank || 0)}${s.isLeader ? ", leader" : ""})`).join(", ")}`);
   }
-
-  return selected.sort((a,b) => ((b.hunterScore||b.opportunityRank||0) - (a.hunterScore||a.opportunityRank||0)));
+  return selected;
 }
 function updateTradeExcursion(trade, livePrice) {
   if (!Number.isFinite(livePrice)) return;
@@ -7458,6 +7455,10 @@ async function processSignals(signals) {
     }
 
     if (countOpenTradesByMarket(trades,signal.market) >= MAX_POSITIONS[signal.market]) continue;
+    // FIX B: daily cap per market, so firing every A* setup can't flood the channel
+    const today = new Date().toISOString().slice(0, 10);
+    const firedToday = trades.filter(t => t.market === signal.market && String(t.sentAt || "").slice(0, 10) === today).length;
+    if (firedToday >= MAX_SIGNALS_PER_MARKET_DAY) { log(`⏳ Daily cap: ${signal.market} already fired ${firedToday} today, skipping ${signal.asset}`); continue; }
     // V96: strict single pending per market -- crypto especially
     // Too many pending signals = noise, fills never happen, force closes pile up
     const pendingTrades = trades.filter(t => t.market===signal.market && t.status==="PENDING");
