@@ -1,5 +1,5 @@
 /**
- * portfolio-bot-v8.js — HUNTER V15.2 🏹
+ * portfolio-bot-v8.js — HUNTER V16 🏹
  *
  * Built on V14.2 (unchanged: scoring, universe, Revolut filter, learning,
  * late-entry veto, -14% / +20% bracket). Changes, each switchable:
@@ -28,6 +28,10 @@
  *    its change over 20 trading days and a tag: RISING (≥ +0.15 pts),
  *    FALLING (≤ -0.15 pts) or FLAT. Background context only, never scored.
  *    Needs us10y / us10y_chg20d / yield_regime columns. HUNTER_YIELD_REGIME=off disables.
+ * 7. TREND LANE (V16) — hunter_trend.js (same folder): the portfolio-manager
+ *    Hunter (OPEN / HOLD / CLOSE on daily trends) for crypto, US stocks and
+ *    LSE shares, with its watchlist lifecycle and momentum-event alerts.
+ *    Posts live to the same Discord. Own tables (trend_*). TREND_LANE=off disables.
  */
 /**
  * portfolio-bot-v8.js — PART 1 of 3
@@ -8318,7 +8322,7 @@ async function startup() {
   );
 
   console.log(
-    'HUNTER V15.2 — CRYPTO EARLY-MOVE LEARNING ENGINE'
+    'HUNTER V16 — CRYPTO EARLY-MOVE + TREND PORTFOLIO LANES'
   );
 
   console.log(
@@ -8391,6 +8395,20 @@ async function startup() {
       console.log('[HUNTER] Fomo smart-money watch: on (Revolut coins only, 2+ traders)');
     } catch (error) {
       console.error(`[HUNTER] Fomo smart-money watch not started: ${error.message}`);
+    }
+  }
+
+  // V16: trend lane (portfolio-manager Hunter) in the same process.
+  if (process.env.TREND_LANE !== 'off') {
+    try {
+      require('./hunter_trend.js').start({
+        db: supabase,
+        notify: alertUser,
+        revolutBases: () => fetchRevolutTradableBases(),
+      });
+      console.log('[HUNTER] Trend lane: on (crypto + US + LSE, daily OPEN/HOLD/CLOSE, live)');
+    } catch (error) {
+      console.error(`[HUNTER] Trend lane not started: ${error.message}`);
     }
   }
 
