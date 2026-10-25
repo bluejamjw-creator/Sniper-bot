@@ -1,5 +1,5 @@
 /**
- * portfolio-bot-v8.js — HUNTER V16 🏹
+ * portfolio-bot-v8.js — HUNTER V16.2 🏹
  *
  * Built on V14.2 (unchanged: scoring, universe, Revolut filter, learning,
  * late-entry veto, -14% / +20% bracket). Changes, each switchable:
@@ -32,6 +32,13 @@
  *    Hunter (OPEN / HOLD / CLOSE on daily trends) for crypto, US stocks and
  *    LSE shares, with its watchlist lifecycle and momentum-event alerts.
  *    Posts live to the same Discord. Own tables (trend_*). TREND_LANE=off disables.
+ * 8. HORSE PICKS (V16.1) — horse_picks.js (same folder): UK/IRE racing via The
+ *    Racing API. Paper phase by default (field audit + tracked picks, no posts);
+ *    HORSE_POSTS=on posts to DISCORD_WEBHOOK_HORSES. Own tables (horse_*).
+ * 9. FOOTY PICKS (V16.2) — football_picks.js (same folder): value singles (1X2)
+ *    for European leagues, UEFA cups and internationals. Coverage audit +
+ *    walk-forward backtest; paper phase by default; FOOTY_POSTS=on posts
+ *    backtest-passed leagues to DISCORD_WEBHOOK_FOOTY. Own tables (football_*).
  */
 /**
  * portfolio-bot-v8.js — PART 1 of 3
@@ -8322,7 +8329,7 @@ async function startup() {
   );
 
   console.log(
-    'HUNTER V16 — CRYPTO EARLY-MOVE + TREND PORTFOLIO LANES'
+    'HUNTER V16.2 — CRYPTO EARLY-MOVE + TREND PORTFOLIO LANES + HORSE & FOOTY PICKS'
   );
 
   console.log(
@@ -8409,6 +8416,24 @@ async function startup() {
       console.log('[HUNTER] Trend lane: on (crypto + US + LSE, daily OPEN/HOLD/CLOSE, live)');
     } catch (error) {
       console.error(`[HUNTER] Trend lane not started: ${error.message}`);
+    }
+  }
+
+  // V16.1: horse picks (paper phase unless HORSE_POSTS=on).
+  if (process.env.HORSE_PICKS !== 'off') {
+    try {
+      require('./horse_picks.js').start({ db: supabase });
+    } catch (error) {
+      console.error(`[HUNTER] Horse picks not started: ${error.message}`);
+    }
+  }
+
+  // V16.2: footy picks (paper phase unless FOOTY_POSTS=on).
+  if (process.env.FOOTY_PICKS !== 'off') {
+    try {
+      require('./football_picks.js').start({ db: supabase });
+    } catch (error) {
+      console.error(`[HUNTER] Footy picks not started: ${error.message}`);
     }
   }
 
