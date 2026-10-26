@@ -75,13 +75,19 @@ const log = m => console.log(`[HORSES] ${m}`);
 const round2 = v => Math.round(v * 100) / 100;
 
 // ---------------------------------------------------------------- API
-async function api(path, params = {}) {
+// The free plan allows 1 request per second: space calls 1.2 s apart and retry once on 429.
+let lastCallAt = 0;
+async function api(path, params = {}, retry = true) {
+  const wait = lastCallAt + 1200 - Date.now();
+  if (wait > 0) await new Promise(r => setTimeout(r, wait));
+  lastCallAt = Date.now();
   const u = new URL(CFG.base + path);
   for (const [k, v] of Object.entries(params)) [].concat(v).forEach(x => u.searchParams.append(k, x));
   const auth = Buffer.from(`${CFG.user}:${CFG.pass}`).toString('base64');
   try {
     const res = await fetch(u, { headers: { Authorization: `Basic ${auth}`, Accept: 'application/json' }, signal: AbortSignal.timeout(30000) });
     const body = await res.json().catch(() => null);
+    if (res.status === 429 && retry) { await new Promise(r => setTimeout(r, 2500)); return api(path, params, false); }
     return { status: res.status, body };
   } catch (e) { return { status: 0, body: null, error: e.message }; }
 }
@@ -475,7 +481,10 @@ async function tick() {
       else await runAudit(await fetchRacecards('today'), await fetchResults());
     }
     const done = await kvGet(`day_${day}`);
-    if (h >= CFG.pickHourUK && h < 20 && !done && STATE.lastDayRun !== day) { STATE.lastDayRun = day; await makePicks(day); }
+    if (h >= CFG.pickHourUK && h < 20 && !done && STATE.lastDayRun !== day) {
+      const ok = await makePicks(day);
+      if (ok) STATE.lastDayRun = day; // a failed fetch retries on the next tick instead of giving up for the day
+    }
     for (const sh of CFG.settleHoursUK) {
       const key = `${day}:${sh}`;
       if (h >= sh && !STATE.settledAt.has(key)) { STATE.settledAt.add(key); await collectResults(day); await settle(day); }

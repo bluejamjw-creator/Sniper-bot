@@ -392,8 +392,15 @@ async function runBacktest(history) {
 
 // ---------------------------------------------------------------- ratings loaders
 async function loadClubElo() {
-  const day = new Date().toISOString().slice(0, 10);
-  const rows = parseCsv(await getText(`http://api.clubelo.com/${day}`));
+  let rows = [];
+  for (const back of [0, 1, 2]) {
+    const day = new Date(Date.now() - back * DAY).toISOString().slice(0, 10);
+    for (const proto of ['http', 'https']) {
+      rows = parseCsv(await getText(`${proto}://api.clubelo.com/${day}`));
+      if (rows.length > 100) break;
+    }
+    if (rows.length > 100) break;
+  }
   const m = new Map();
   for (const r of rows) if (r.Club && Number(r.Elo)) m.set(r.Club, Number(r.Elo));
   log(`ClubElo: ${m.size} clubs`);
