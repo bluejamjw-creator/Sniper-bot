@@ -38,7 +38,7 @@
 const env = (k, d) => (process.env[k] === undefined || process.env[k] === '' ? d : process.env[k]);
 
 const MODEL = Object.freeze({
-  version: 'v1',
+  version: 'v2', // v2: model blended with the market (weight tuned on 2024/25 only), exchange commission, tested on unseen seasons
   market: 'h2h (90-minute 1X2)',
   minEV: 0.05,
   fragileShift: 0.03,
@@ -51,7 +51,11 @@ const MODEL = Object.freeze({
   maxGoals: 10,
   eloGoals: { club: 2.7, intl: 2.5 },
   eloHome: { club: 65, intl: 100 },
-  backtestSeasons: ['2425', '2526', '2627'],
+  tuneSeason: '2425',               // blend weight chosen here only
+  backtestSeasons: ['2526', '2627'], // judged here only (never seen by the tuning)
+  blendGrid: [0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1],
+  defaultBlend: 0.2,                 // UEFA / INTL until they have their own record
+  commission: { betfair_ex_uk: 0.05, betfair_ex_eu: 0.05, smarkets: 0.02, matchbook: 0.02 },
   historySeasons: ['2223', '2324', '2425', '2526', '2627'],
   pass: { minBets: 100, minROI: 0, minCLV: 0 },
   decisionWindowH: 24,
@@ -272,18 +276,41 @@ function buildIntlElo(rows) {
 }
 
 // ---------------------------------------------------------------- odds helpers
+// Best price per outcome AFTER exchange commission (what you'd actually receive).
 function bestPrices(event) {
   const out = { home: null, draw: null, away: null };
   for (const bk of event.bookmakers || []) {
     const mk = (bk.markets || []).find(m => m.key === 'h2h');
     if (!mk) continue;
+    const c = MODEL.commission[bk.key] || 0;
     for (const o of mk.outcomes || []) {
       const side = o.name === event.home_team ? 'home' : o.name === event.away_team ? 'away' : /draw/i.test(o.name) ? 'draw' : null;
       if (!side || !(o.price > 1)) continue;
-      if (!out[side] || o.price > out[side].price) out[side] = { price: o.price, book: bk.title || bk.key, at: mk.last_update || bk.last_update };
+      const net = 1 + (o.price - 1) * (1 - c);
+      if (!out[side] || net > out[side].price) out[side] = { price: round(net, 3), quoted: o.price, book: bk.title || bk.key, at: mk.last_update || bk.last_update };
     }
   }
   return out;
+}
+// Market consensus: each bookmaker's de-margined probabilities, averaged.
+function marketConsensus(event) {
+  const acc = { home: 0, draw: 0, away: 0 }; let nb = 0;
+  for (const bk of event.bookmakers || []) {
+    const mk = (bk.markets || []).find(m => m.key === 'h2h');
+    if (!mk) continue;
+    const pr = {};
+    for (const o of mk.outcomes || []) {
+      const side = o.name === event.home_team ? 'home' : o.name === event.away_team ? 'away' : /draw/i.test(o.name) ? 'draw' : null;
+      if (side && o.price > 1) pr[side] = { price: o.price };
+    }
+    const m = marketProbs(pr);
+    if (!m) continue;
+    acc.home += m.home; acc.draw += m.draw; acc.away += m.away; nb++;
+  }
+  return nb ? { home: acc.home / nb, draw: acc.draw / nb, away: acc.away / nb, books: nb } : null;
+}
+function blend(model, market, w) {
+  return { home: w * model.home + (1 - w) * market.home, draw: w * model.draw + (1 - w) * market.draw, away: w * model.away + (1 - w) * market.away };
 }
 function marketProbs(prices) {
   if (!prices.home || !prices.draw || !prices.away) return null;
@@ -297,7 +324,7 @@ function evaluate(probs, prices) {
   const opts = ['home', 'draw', 'away'].filter(s => prices[s]).map(s => {
     const p = probs[s], d = prices[s].price;
     const ev = p * d - 1, evLow = (p - MODEL.fragileShift) * d - 1;
-    return { side: s, p, d, ev, evLow, book: prices[s].book, at: prices[s].at, minPrice: (1 + MODEL.minEV) / p };
+    return { side: s, p, d, quoted: prices[s].quoted ?? d, ev, evLow, book: prices[s].book, at: prices[s].at, minPrice: (1 + MODEL.minEV) / p };
   }).sort((a, b) => b.ev - a.ev);
   const best = opts[0] || null;
   return { best, qualifies: Boolean(best && best.ev >= MODEL.minEV), fragile: Boolean(best && best.evLow < 0) };
@@ -331,11 +358,11 @@ async function loadDomesticHistory() {
 }
 
 async function backtestLeague(rows) {
-  const test = rows.filter(r => MODEL.backtestSeasons.includes(r.season));
+  const seasons = [MODEL.tuneSeason, ...MODEL.backtestSeasons];
+  const target = rows.filter(r => seasons.includes(r.season));
   const byWeek = new Map();
-  for (const r of test) { const wk = Math.floor((r.t - 4 * DAY) / (7 * DAY)); if (!byWeek.has(wk)) byWeek.set(wk, []); byWeek.get(wk).push(r); }
-  const bets = [];
-  let ll = 0, llMkt = 0, nPred = 0;
+  for (const r of target) { const wk = Math.floor((r.t - 4 * DAY) / (7 * DAY)); if (!byWeek.has(wk)) byWeek.set(wk, []); byWeek.get(wk).push(r); }
+  const preds = [];
   for (const [wk, games] of [...byWeek.entries()].sort((a, b) => a[0] - b[0])) {
     const asOf = wk * 7 * DAY + 4 * DAY;
     await new Promise(r => setImmediate(r)); // let Hunter's other work run between weekly refits
@@ -343,17 +370,29 @@ async function backtestLeague(rows) {
     for (const g of games) {
       const pr = predictDomestic(fit, g.home, g.away);
       if (!pr.ok || !g.b365.home || !g.b365.draw || !g.b365.away) continue;
-      const res = g.hg > g.ag ? 'home' : g.hg === g.ag ? 'draw' : 'away';
-      const mk = marketProbs({ home: { price: g.b365.home }, draw: { price: g.b365.draw }, away: { price: g.b365.away } });
-      ll += -Math.log(Math.max(1e-9, pr[res])); llMkt += -Math.log(Math.max(1e-9, mk[res])); nPred++;
-      const ev = evaluate(pr, { home: { price: g.b365.home }, draw: { price: g.b365.draw }, away: { price: g.b365.away } });
-      if (!ev.qualifies) continue;
-      const s = ev.best.side;
-      const clv = g.close[s] ? ev.best.d / g.close[s] - 1 : null;
-      bets.push({ t: g.t, side: s, d: ev.best.d, ev: ev.best.ev, fragile: ev.fragile, won: res === s, profit: res === s ? ev.best.d - 1 : -1, clv });
+      const prices = { home: { price: g.b365.home }, draw: { price: g.b365.draw }, away: { price: g.b365.away } };
+      preds.push({ g, season: g.season, model: pr, market: marketProbs(prices), prices, res: g.hg > g.ag ? 'home' : g.hg === g.ag ? 'draw' : 'away' });
     }
   }
-  return { bets, logLoss: nPred ? ll / nPred : null, marketLogLoss: nPred ? llMkt / nPred : null, predicted: nPred };
+  const ll = (list, fn) => list.length ? list.reduce((s, x) => s - Math.log(Math.max(1e-9, fn(x)[x.res])), 0) / list.length : null;
+  // 1. Choose the blend weight on the tuning season ONLY (log loss).
+  const tune = preds.filter(x => x.season === MODEL.tuneSeason);
+  let w = MODEL.defaultBlend, best = Infinity;
+  for (const cand of MODEL.blendGrid) { const v = ll(tune, x => blend(x.model, x.market, cand)); if (v !== null && v < best) { best = v; w = cand; } }
+  // 2. Judge on the unseen seasons with that fixed weight.
+  const test = preds.filter(x => MODEL.backtestSeasons.includes(x.season));
+  const bets = [];
+  for (const x of test) {
+    const ev = evaluate(blend(x.model, x.market, w), x.prices);
+    if (!ev.qualifies) continue;
+    const s = ev.best.side;
+    const clv = x.g.close[s] ? ev.best.d / x.g.close[s] - 1 : null;
+    bets.push({ t: x.g.t, side: s, d: ev.best.d, ev: ev.best.ev, fragile: ev.fragile, won: x.res === s, profit: x.res === s ? ev.best.d - 1 : -1, clv });
+  }
+  return {
+    w, bets, predicted: test.length, tunePredicted: tune.length,
+    logLoss: ll(test, x => blend(x.model, x.market, w)), modelLogLoss: ll(test, x => x.model), marketLogLoss: ll(test, x => x.market),
+  };
 }
 
 function summariseBets(bets) {
@@ -382,10 +421,12 @@ async function runBacktest(history) {
     all.push(...r.bets);
     const sm = summariseBets(r.bets);
     const pass = sm.bets >= MODEL.pass.minBets && sm.roi > MODEL.pass.minROI && sm.avgCLV !== null && sm.avgCLV > MODEL.pass.minCLV;
-    leagues[c.key] = { label: c.label, ...sm, logLoss: round(r.logLoss), marketLogLoss: round(r.marketLogLoss), predicted: r.predicted, pass };
+    leagues[c.key] = { label: c.label, blendWeight: r.w, ...sm, logLoss: round(r.logLoss), modelLogLoss: round(r.modelLogLoss), marketLogLoss: round(r.marketLogLoss), predicted: r.predicted, pass };
   }
   const capped = applyDailyCap(all);
-  const result = { at: new Date().toISOString(), model: MODEL.version, seasons: MODEL.backtestSeasons, price: 'Bet365 pre-match (football-data.co.uk)', leagues, portfolioCapped3: summariseBets(capped) };
+  const ws = Object.values(leagues).map(l => l.blendWeight).filter(Number.isFinite).sort((a, b) => a - b);
+  const medianW = ws.length ? ws[Math.floor(ws.length / 2)] : MODEL.defaultBlend;
+  const result = { at: new Date().toISOString(), model: MODEL.version, tuneSeason: MODEL.tuneSeason, testSeasons: MODEL.backtestSeasons, price: 'Bet365 pre-match (football-data.co.uk)', medianBlendWeight: medianW, leagues, portfolioCapped3: summariseBets(capped) };
   log(`BACKTEST ${JSON.stringify(result)}`);
   return result;
 }
@@ -505,7 +546,11 @@ async function dailyRun(day) {
       const t = Date.parse(ev.commence_time);
       if (!(t > now && t - now <= MODEL.decisionWindowH * 3600000)) continue;
       const prices = bestPrices(ev);
-      const probs = probabilitiesFor(comp, ev);
+      const raw = probabilitiesFor(comp, ev);
+      const market = marketConsensus(ev);
+      const bt = STATE.backtest && STATE.backtest.leagues && STATE.backtest.leagues[comp.key];
+      const w = bt && Number.isFinite(bt.blendWeight) ? bt.blendWeight : (STATE.backtest && Number.isFinite(STATE.backtest.medianBlendWeight) ? STATE.backtest.medianBlendWeight : MODEL.defaultBlend);
+      const probs = raw.ok && market ? { ...raw, ...blend(raw, market, w), raw: { home: raw.home, draw: raw.draw, away: raw.away }, market, w } : raw.ok ? { ok: false, reason: 'no market consensus' } : raw;
       const row = { comp, ev, t, prices, probs, fetchedAt };
       if (!probs.ok) { row.reason = probs.reason; all.push(row); continue; }
       if (!prices.home || !prices.draw || !prices.away) { row.reason = 'incomplete prices'; all.push(row); continue; }
@@ -524,6 +569,8 @@ async function dailyRun(day) {
       await DB.from('football_candidates').upsert({
         id: `${r.ev.id}`, decided_day: day, competition: r.comp.key, grp: r.comp.group, home: r.ev.home_team, away: r.ev.away_team, kickoff: new Date(r.t).toISOString(),
         model: r.probs.model || null, p_home: round(r.probs.home), p_draw: round(r.probs.draw), p_away: round(r.probs.away),
+        blend_w: r.probs.w ?? null, raw_home: round(r.probs.raw?.home), raw_draw: round(r.probs.raw?.draw), raw_away: round(r.probs.raw?.away),
+        mkt_home: round(r.probs.market?.home), mkt_draw: round(r.probs.market?.draw), mkt_away: round(r.probs.market?.away),
         price_home: r.prices.home?.price ?? null, price_draw: r.prices.draw?.price ?? null, price_away: r.prices.away?.price ?? null,
         best_side: r.best?.side ?? null, best_price: r.best?.d ?? null, best_book: r.best?.book ?? null, ev: round(r.best?.ev), ev_low: round(r.best?.evLow), min_price: round(r.best?.minPrice, 3),
         fragile: r.fragile ?? null, qualifies: Boolean(r.qualifies), selected: selSet.has(r), posted: posting.includes(r), reason: r.reason || null,
@@ -544,7 +591,7 @@ function picksMessage(day, picks, evaluated) {
     lines.push(`${i === 0 ? '⭐ ' : ''}${r.comp.label} · ${ukTime(r.t)}`);
     lines.push(`${r.ev.home_team} v ${r.ev.away_team}`);
     lines.push(`Selection: ${sideName(r, r.best.side)} (90 minutes)`);
-    lines.push(`Model chance ${round(r.best.p * 100, 1)}% · price ${r.best.d} (${r.best.book}) · minimum ${round(r.best.minPrice, 2)}`);
+    lines.push(`Model chance ${round(r.best.p * 100, 1)}% · price ${r.best.quoted} (${r.best.book}${r.best.quoted !== r.best.d ? `, ${r.best.d} after commission` : ''}) · minimum ${round(r.best.minPrice, 2)}`);
     lines.push(`Estimated value +${round(r.best.ev * 100, 1)}%${r.fragile ? ' · fragile (gone if the model is 3 pts too high)' : ''}`);
     lines.push(`Odds checked ${new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit' }).format(Date.parse(r.fetchedAt))}`, '');
   });
@@ -644,7 +691,7 @@ async function refreshModels(force = false) {
     const history = await loadDomesticHistory();
     for (const [key, rows] of history) STATE.domestic.set(key, rows.length ? fitPoisson(rows, Date.now()) : null);
     const last = await kvGet('backtest');
-    const stale = !last || Date.now() - Date.parse(last.at) > 7 * DAY;
+    const stale = !last || last.model !== MODEL.version || Date.now() - Date.parse(last.at) > 7 * DAY;
     if (stale) { STATE.backtest = await runBacktest(history); await kvSet('backtest', STATE.backtest); } else STATE.backtest = last;
     STATE.clubElo = await loadClubElo();
     STATE.intlElo = await loadIntlElo();
@@ -680,7 +727,7 @@ function start(opts = {}) {
 }
 
 module.exports = {
-  start, tick, MODEL, COMPS, STATE, fitPoisson, predictDomestic, scoreMatrixProbs, eloProbs, buildIntlElo, matchTeam, norm,
+  marketConsensus, blend, start, tick, MODEL, COMPS, STATE, fitPoisson, predictDomestic, scoreMatrixProbs, eloProbs, buildIntlElo, matchTeam, norm,
   bestPrices, marketProbs, evaluate, rankAndCap, backtestLeague, summariseBets, applyDailyCap, parseCsv, fdDate, picksMessage,
   dailyRun, settle, weeklyReport, runBacktest, _setDb: d => { DB = d; }, _cfg: CFG,
 };

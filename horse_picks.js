@@ -42,7 +42,7 @@
 const env = (k, d) => (process.env[k] === undefined || process.env[k] === '' ? d : process.env[k]);
 
 const MODEL = Object.freeze({
-  version: 'v1',
+  version: 'v1.1', // v1.1: handicaps allowed (rating off there), fields up to 12, unrated runners turn rating off for that race
   weights: { form: 35, rating: 25, cd: 15, fresh: 10, trainer: 8, jockey: 7 },
   formWeights: [1.0, 0.8, 0.6, 0.45, 0.3, 0.2],
   formFallbackQ: { 1: 1.0, 2: 0.75, 3: 0.6, 4: 0.45, 5: 0.3, 6: 0.2, 7: 0.15, 8: 0.1, 9: 0.05, 0: 0 },
@@ -52,7 +52,7 @@ const MODEL = Object.freeze({
   cdPoints: { CD: 15, C_AND_D: 12, D: 9, C: 6, NONE: 0 },
   smoothing: 20,
   humanFormMinDays: 14,
-  field: { min: 4, max: 10 },
+  field: { min: 4, max: 12 },
   regions: ['GB', 'IRE'],
   minScore: 75,
   minGap: 8,
@@ -226,21 +226,26 @@ function humanPoints(stats, id, M) {
 function scoreRace(race, on, human) {
   const region = F.region(race);
   if (!MODEL.regions.includes(region)) return { eligible: false, reason: `region ${region || '?'}` };
-  if (F.isHandicap(race)) return { eligible: false, reason: 'handicap' };
+  const handicap = F.isHandicap(race);
   const runners = F.runners(race).filter(x => !F.nonRunner(x));
   if (runners.length < MODEL.field.min || runners.length > MODEL.field.max) return { eligible: false, reason: `field ${runners.length}` };
   const off = Date.parse(F.off(race));
   if (Number.isFinite(off) && off <= Date.now()) return { eligible: false, reason: 'started' };
+  // v1.1: in handicaps the weights already equalise ratings, and a race with
+  // any unrated runner can't be compared fairly on ratings — in both cases the
+  // rating component is switched off for the WHOLE race (never per horse).
+  const anyUnrated = runners.some(x => F.or(x) === null);
+  on = { ...on, rating: on.rating && !handicap && !anyUnrated };
   // Core data for EVERY runner, or skip the race (never score a partial field).
   for (const x of runners) {
-    if (on.rating && F.or(x) === null) return { eligible: false, reason: 'unrated runner' };
     if (on.form && !formPoints(F.form(x))) return { eligible: false, reason: 'runner with <3 starts / no form' };
     if (on.fresh && F.lastRun(x) === null) return { eligible: false, reason: 'missing last-run date' };
     if (on.cd && F.cd(x) === undefined) return { eligible: false, reason: 'missing C/D data' };
   }
   const humanOn = Boolean(human && human.trainer && human.jockey);
   const useOn = { ...on, trainer: humanOn, jockey: humanOn };
-  const { name: profile, available } = profileName(useOn);
+  const { name: baseProfile, available } = profileName(useOn);
+  const profile = `${baseProfile}${handicap ? '_hcap' : anyUnrated ? '_unrated' : ''}`;
   const top = on.rating ? Math.max(...runners.map(F.or)) : null;
   const scored = runners.map(x => {
     const comp = {};
@@ -317,12 +322,12 @@ function picksMessage(day, picks, stats) {
   const lines = [`🏇 HORSE PICKS — ${day}`, ''];
   for (const p of picks) {
     lines.push(`${p.nap ? '⭐ NAP — ' : ''}${fmtOff(p.race)} ${F.course(p.race)} — ${p.pick.horse}${p.pick.number ? ` (${p.pick.number})` : ''}`);
-    lines.push(`${F.name(p.race)}`);
+    lines.push(`${F.name(p.race)}${/_hcap$/.test(p.profile) ? ' (handicap: scored on form and freshness)' : /_unrated$/.test(p.profile) ? ' (unrated runners: scored on form and freshness)' : ''}`);
     lines.push(`Score ${p.pick.score.toFixed(1)}/100, ${p.gap.toFixed(1)} points clear of ${p.runnerUp.horse}`);
     for (const r of p.pick.reasons.slice(0, 3)) lines.push(`· ${r}`);
     lines.push('');
   }
-  lines.push(`Model ${picks[0].profile} · level 1-unit win stakes, tracked and settled from results.`, 'Scores rank horses; they are not win chances. Educational only — bet responsibly.');
+  lines.push(`Model ${MODEL.version} · every pick is tracked against the result (win rate vs the top-rated horse; this data plan has no starting prices, so profit isn't measured).`, 'Scores rank horses; they are not win chances. Educational only — bet responsibly.');
   return lines.join('\n');
 }
 
@@ -382,7 +387,7 @@ async function makePicks(day) {
         baseline: JSON.stringify(baseline), status: 'pending', posted: CFG.posts, created_at: new Date().toISOString(),
       });
     }
-    await kvSet(`day_${day}`, { stats, picks: picks.length, profile: picks[0]?.profile || audit.profile, posts: CFG.posts });
+    await kvSet(`day_${day}`, { stats, picks: picks.length, profile: picks[0]?.profile || audit.profile, posts: CFG.posts, version: MODEL.version });
   }
   await post(picksMessage(day, picks, stats));
   return { picks, stats };
@@ -480,7 +485,8 @@ async function tick() {
       if (saved && saved.at && saved.at.slice(0, 10) === new Date().toISOString().slice(0, 10)) STATE.audit = saved;
       else await runAudit(await fetchRacecards('today'), await fetchResults());
     }
-    const done = await kvGet(`day_${day}`);
+    const prev = await kvGet(`day_${day}`);
+    const done = prev && prev.version === MODEL.version && (prev.posts || !CFG.posts); // re-run once if the model changed or posting was just switched on
     if (h >= CFG.pickHourUK && h < 20 && !done && STATE.lastDayRun !== day) {
       const ok = await makePicks(day);
       if (ok) STATE.lastDayRun = day; // a failed fetch retries on the next tick instead of giving up for the day
