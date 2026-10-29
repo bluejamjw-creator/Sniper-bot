@@ -4586,6 +4586,111 @@ async function grindShadowSummaryLines() {
   } catch { return []; }
 }
 
+// ══ League-confirmed signal shadow test ══════════════════════════
+// Every signal the scan produces is logged with how many days its asset has been on the Intel league table (30-day window).
+// qualifies = 3+ league days. We then follow each logged signal's own entry/stop/target (assumes it filled) and later compare
+// "qualifies" against "does not qualify". NOTHING here sends an alert or changes any gate, entry, sizing or exit.
+const LS_MIN_DAYS = Number(process.env.LEAGUE_SHADOW_MIN_DAYS || 3);
+const LS_EXPIRE_DAYS = 7;
+const LEAGUE_SHADOW = process.env.LEAGUE_SHADOW !== "0";
+let lsDays = new Map(), lsDaysAt = 0;
+const lsRecent = new Map(); // asset -> { at, id }
+const lsNorm = (asset, market) => ({ cls: market === "CRYPTO" ? "crypto" : "stock", sym: String(asset).replace(/USDT$/, "").replace(/\.L$/, "") });
+async function lsLeagueDays(asset, market) {
+  if (Date.now() - lsDaysAt > 3 * 3600 * 1000) {
+    try {
+      const lg = leagueBuild(await leagueFetchRows());
+      lsDays = new Map(lg.all.map(e => [`${e.cls}:${e.sym}`, e.n]));
+      lsDaysAt = Date.now();
+    } catch (e) { lsDaysAt = Date.now() - 2.5 * 3600 * 1000; log(`⚠️ League shadow: league load failed (${e.message})`); }
+  }
+  const { cls, sym } = lsNorm(asset, market);
+  return lsDays.get(`${cls}:${sym}`) || 0;
+}
+async function leagueShadowRecord(signal) {
+  try {
+    if (!LEAGUE_SHADOW || !supabaseEnabled || !(signal.entry > 0) || !(signal.sl > 0) || !(signal.tp > 0)) return;
+    const prev = lsRecent.get(signal.asset);
+    if (prev && Date.now() - prev.at < 24 * 3600 * 1000) return;
+    const days = await lsLeagueDays(signal.asset, signal.market);
+    const { data, error } = await retry(() => supabase.from("league_signal_shadow").insert({
+      symbol: signal.asset, market: signal.market, league_days: days, qualifies: days >= LS_MIN_DAYS,
+      score: signal.score ?? null, grade: signal.grade ?? null, entry: signal.entry, sl: signal.sl, tp: signal.tp
+    }).select("id").single());
+    if (error) { log(`⚠️ League shadow insert: ${error.message}`); return; }
+    lsRecent.set(signal.asset, { at: Date.now(), id: data?.id });
+    log(`🧪 League shadow: ${signal.asset} logged (${days} league day${days === 1 ? "" : "s"}, ${days >= LS_MIN_DAYS ? "QUALIFIES" : "does not qualify"})`);
+  } catch (e) { log(`⚠️ League shadow record: ${e.message}`); }
+}
+function leagueShadowMarkFired(asset) {
+  const r = lsRecent.get(asset);
+  if (!r?.id || !supabaseEnabled) return;
+  Promise.resolve(retry(() => supabase.from("league_signal_shadow").update({ fired_live: true }).eq("id", r.id))).catch(() => {});
+}
+async function lsBars(row) {
+  const created = new Date(row.created_at).getTime();
+  if (row.market === "CRYPTO") {
+    const { data } = await retry(() => axios.get("https://data-api.binance.vision/api/v3/klines", { params: { symbol: row.symbol, interval: "1h", startTime: created, limit: 200 }, timeout: 12000 }));
+    return data.map(k => ({ t: +k[0], end: +k[0] + 3600000, h: +k[2], l: +k[3], c: +k[4] }));
+  }
+  const sym = lsNorm(row.symbol, row.market).sym;
+  const hist = await pickerFetchStockDaily([sym], 14);
+  const dayStart = new Date(created).setUTCHours(0, 0, 0, 0);
+  return (hist[sym] || []).filter(b => b.t >= dayStart).map(b => ({ t: b.t, end: b.t + 86400000, h: b.h, l: b.l, c: b.c }));
+}
+async function checkLeagueShadowOutcomes() {
+  if (!LEAGUE_SHADOW || !supabaseEnabled) return;
+  try {
+    const { data } = await retry(() => supabase.from("league_signal_shadow").select("*").eq("outcome", "OPEN").order("created_at").limit(40));
+    if (!data?.length) return;
+    const now = Date.now();
+    for (const r of data) {
+      let bars;
+      try { bars = await lsBars(r); } catch { continue; }
+      if (!bars?.length) continue;
+      const created = new Date(r.created_at).getTime();
+      const entry = +r.entry, sl = +r.sl, tp = +r.tp, risk = Math.abs(entry - sl);
+      if (!(risk > 0)) continue;
+      const long = tp > entry, patch = { last_checked: new Date().toISOString() };
+      const closedBars = bars.filter(b => b.end <= now || r.market !== "CRYPTO"); // crypto: closed hours only; stocks: daily bar incl. today
+      for (const b of closedBars) {
+        if (r.price_24h == null && b.end >= created + 24 * 3600000 && b.end <= now) patch.price_24h = b.c;
+        if (r.price_72h == null && b.end >= created + 72 * 3600000 && b.end <= now) patch.price_72h = b.c;
+      }
+      for (const b of closedBars) {
+        const hitSL = long ? b.l <= sl : b.h >= sl, hitTP = long ? b.h >= tp : b.l <= tp;
+        if (hitSL || hitTP) { // both in one bar => count as stopped (conservative)
+          patch.outcome = hitSL ? "SL" : "TP"; patch.r_multiple = hitSL ? -1 : Math.round(Math.abs(tp - entry) / risk * 100) / 100;
+          patch.closed_at = new Date(Math.min(now, b.end)).toISOString(); break;
+        }
+      }
+      if (!patch.outcome && now - created > LS_EXPIRE_DAYS * 86400000) {
+        const last = closedBars[closedBars.length - 1];
+        patch.outcome = "EXPIRED"; patch.closed_at = new Date().toISOString();
+        patch.r_multiple = last ? Math.round(((long ? last.c - entry : entry - last.c) / risk) * 100) / 100 : 0;
+      }
+      await retry(() => supabase.from("league_signal_shadow").update(patch).eq("id", r.id));
+    }
+  } catch (e) { log(`⚠️ League shadow outcomes: ${e.message}`); }
+}
+async function leagueShadowSummaryLines() {
+  if (!LEAGUE_SHADOW || !supabaseEnabled) return [];
+  try {
+    const { data } = await retry(() => supabase.from("league_signal_shadow").select("qualifies,outcome,r_multiple").limit(5000));
+    if (!data?.length) return ["🧪 <b>League-signal test</b> (shadow, no alerts): collecting data."];
+    const L = [`🧪 <b>League-signal test</b> (shadow, changes nothing) — signals with ${LS_MIN_DAYS}+ league days vs the rest`];
+    for (const q of [true, false]) {
+      const rows = data.filter(x => x.qualifies === q), done = rows.filter(x => x.outcome !== "OPEN");
+      const wins = done.filter(x => x.outcome === "TP").length, rs = done.map(x => Number(x.r_multiple) || 0);
+      const avgR = rs.length ? rs.reduce((a, b) => a + b, 0) / rs.length : 0;
+      L.push(`${q ? "On the league" : "Not on the league"}: ${rows.length} logged · ${done.length} finished · ${done.length ? `${Math.round(wins / done.length * 100)}% hit target · avg ${avgR >= 0 ? "+" : ""}${avgR.toFixed(2)}R` : "no results yet"}`);
+    }
+    const n = data.filter(x => x.qualifies && x.outcome !== "OPEN").length;
+    if (n < 30) L.push("<i>Too few finished league signals to conclude anything (need 30+ and several weeks). Assumes every signal filled at its entry.</i>");
+    return L;
+  } catch { return []; }
+}
+
 async function runWeeklyRegimeJob() {
   const isSunday = new Date().getDay() === 0;
   if (!isSunday) return;
@@ -7624,6 +7729,7 @@ async function processSignals(signals) {
   const trades = await loadTradesCached();
 
   for (const signal of signals) {
+    await leagueShadowRecord(signal); // shadow test only: logs, never gates
     // FIX D: open trades used to be handled wrongly in two ways. (1) ANY single open trade in a market blocked every
     // new signal there, even with free slots (MSTR open => NVDA/AVGO never sent). (2) A new crypto signal could close an
     // open trade although there was room (CRV/SUI/TIA "replaced" minutes after opening). Now: a free slot just opens;
@@ -7695,6 +7801,7 @@ async function processSignals(signals) {
     await checkAssetMilestones(signal);
 
     alerts.push({ id:alertId, asset:signal.asset, market:signal.market, sentAt });
+    leagueShadowMarkFired(signal.asset);
     trades.push({
       id:`${signal.asset}-${Date.now()}`, asset:signal.asset, market:signal.market,
       setupType:signal.setupType, entryType:signal.entryType,
@@ -8236,6 +8343,7 @@ async function safeCycle() {
     if (Date.now() - lastGrindShadowCheck > 20 * 60 * 1000) {
       lastGrindShadowCheck = Date.now();
       await safeRun("grindShadowOutcomes", checkGrindShadowOutcomes);
+      await safeRun("leagueShadowOutcomes", checkLeagueShadowOutcomes);
     }
     if (Date.now() - lastRejectionOutcomeCheck > 40 * 60 * 1000) {
       lastRejectionOutcomeCheck = Date.now();
@@ -8786,6 +8894,7 @@ async function sendWeeklyReview(ctx) {
 
   if (grinders) { L.push(...pickerGrindersLines(grinders)); L.push(""); }
   try { L.push(...persistShadowLines(bySym)); L.push(""); } catch { /* optional */ }
+  try { const lsl = await leagueShadowSummaryLines(); if (lsl.length) { L.push(...lsl); L.push(""); } } catch { /* optional */ }
   try { const gsl = await grindShadowSummaryLines(); if (gsl.length) { L.push(...gsl); L.push(""); } } catch { /* optional */ }
 
   // scorecard
@@ -9338,7 +9447,10 @@ server = app.listen(PORT, "0.0.0.0", async () => {
   // Startup is silent unless something needs attention (no routine "online" banner).
   const bootProblems = [];
   if (!ALPACA_API_KEY) bootProblems.push("Alpaca keys missing");
-  if (!BOT_TOKEN || !CHAT_ID) bootProblems.push("Telegram token/chat id missing");
+  if (TELEGRAM_ALERTS) {
+    if (!BOT_TOKEN) bootProblems.push("Telegram: BOT_TOKEN is empty");
+    if (!CHAT_ID && !CHANNEL_ID) bootProblems.push("Telegram: neither CHAT_ID nor CHANNEL_CHAT_ID is set");
+  }
   if (!supabaseEnabled) bootProblems.push("Supabase not configured (local JSON only)");
   log(`Boot check: Alpaca=${ALPACA_API_KEY ? "on" : "OFF"} Polygon=${POLYGON_API_KEY ? "on" : "off"} Supabase=${supabaseEnabled ? "on" : "OFF"}`);
   if (bootProblems.length) await safeRun("bootProblems", () => sendPrivate(`\u26A0\uFE0F <b>Sniper started with issues</b>\n${bootProblems.map(x => "\u2022 " + x).join("\n")}`));
