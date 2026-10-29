@@ -217,6 +217,8 @@ const FILES    = {
 const ACCOUNT_BALANCE     = 10000;
 const BASE_RISK_PER_TRADE = 0.01;
 const MAX_PORTFOLIO_RISK  = 0.08; // V98: raised from 5% -- allows 2-3 concurrent signals
+const REPLACE_MIN_AGE_HOURS_CRYPTO = Number(process.env.REPLACE_MIN_AGE_CRYPTO_H || 2);  // FIX D: a trade is never replaced sooner than this after opening
+const REPLACE_MIN_AGE_HOURS_STOCK  = Number(process.env.REPLACE_MIN_AGE_STOCK_H  || 24);
 const MAX_POSITIONS = { CRYPTO: 3, US: 2, LSE: 2 }; // V98: raised for subscription -- subscribers miss signals at 1
 const ENABLE_CRYPTO = true;
 const ENABLE_US     = true;
@@ -1725,6 +1727,41 @@ function telegramHtmlToDiscordMarkdown(html) {
     .replace(/<[^>]+>/g, ""); // strip anything else rather than leak raw tags
 }
 
+// Which webhook is this? (for error messages; never logs the URL itself)
+function discordLabel(url) {
+  const m = { signals: DISCORD_WEBHOOK_SIGNALS, picks: DISCORD_WEBHOOK_PICKS, intel: DISCORD_WEBHOOK_INTEL, status: DISCORD_WEBHOOK_STATUS, watchlist: DISCORD_WEBHOOK_WATCHLIST, premium: DISCORD_WEBHOOK_PREMIUM };
+  return Object.keys(m).find(k => m[k] && m[k] === url) || "unknown";
+}
+const badHookAt = {};
+// A 401/404 means the webhook was deleted or regenerated (e.g. after rotating keys). Tell the person once per 12h,
+// through any channel that still works (another Discord hook first, then Telegram).
+async function notifyBadHook(label, status) {
+  if (badHookAt[label] && Date.now() - badHookAt[label] < 12 * 3600 * 1000) return;
+  badHookAt[label] = Date.now();
+  const text = `⚠️ <b>Discord "${label}" webhook is not working</b> (HTTP ${status}). It was deleted or regenerated — create a new webhook for that channel and update DISCORD_WEBHOOK_${label.toUpperCase()} in Railway. Messages for that channel are being dropped until then.`;
+  log(`DISCORD ${label} webhook dead (HTTP ${status})`);
+  try {
+    const order = ["status", "picks", "signals", "intel"].filter(k => k !== label && !(badHookAt[k] && Date.now() - badHookAt[k] < 12 * 3600 * 1000));
+    for (const k of order) {
+      const hook = discordHookFor(k);
+      if (!hook) continue;
+      try { await axios.post(hook, { content: telegramHtmlToDiscordMarkdown(text), allowed_mentions: { parse: [] } }, { timeout: 10000 }); return; } catch { /* try next */ }
+    }
+    await telegramPrivate(text);
+  } catch { /* nothing else to try */ }
+}
+async function discordSelfCheck() {
+  if (!DISCORD_ENABLED) return;
+  const hooks = { signals: DISCORD_WEBHOOK_SIGNALS, picks: DISCORD_WEBHOOK_PICKS, intel: DISCORD_WEBHOOK_INTEL, status: DISCORD_WEBHOOK_STATUS };
+  const res = [];
+  for (const [k, url] of Object.entries(hooks)) {
+    if (!url) { res.push(`${k}: not set`); continue; }
+    try { await axios.get(url, { timeout: 8000 }); res.push(`${k}: ok`); }
+    catch (e) { const st = e?.response?.status; res.push(`${k}: ${st || e.message}`); if (st === 401 || st === 404) await notifyBadHook(k, st); }
+  }
+  log(`Discord webhook check -- ${res.join(" | ")}`);
+}
+
 async function sendDiscord(webhookUrl, msg) {
   if (!DISCORD_ENABLED) return; // Discord disabled
   if (!webhookUrl) return; // not configured yet -- safe no-op
@@ -1751,7 +1788,11 @@ async function sendDiscord(webhookUrl, msg) {
       }
       if (chunks.length > 1) await sleep(400);
     }
-  } catch (e) { log(`DISCORD ERROR: ${e.message}`); }
+  } catch (e) {
+    const st = e?.response?.status, label = discordLabel(webhookUrl);
+    log(`DISCORD ERROR (${label}): ${e.message}`);
+    if (st === 401 || st === 404) await notifyBadHook(label, st);
+  }
 }
 
 async function sendSignalsChannels(msg) {
@@ -1759,11 +1800,10 @@ async function sendSignalsChannels(msg) {
   await sendDiscord(DISCORD_WEBHOOK_SIGNALS, msg);
 }
 
-// Movers / market intel / top performers / morning briefing -> Discord #market-intel.
-// ON by default; INTEL_ALERTS=0 mutes them again. (Other routine alerts stay behind ROUTINE_ALERTS.)
-const INTEL_ALERTS = process.env.INTEL_ALERTS !== "0";
+// The old "MARKET INTEL UPDATE" / morning movers / pre-market / market open-close posts are OFF (ROUTINE_ALERTS=1 brings them back).
+// They are replaced by ONE daily Intel League Table (see intelLeagueDaily). Discovery logging still runs either way.
 async function sendIntelChannels(msg) {
-  if (!ROUTINE_ALERTS && !INTEL_ALERTS) return; // discovery logging still runs either way
+  if (!ROUTINE_ALERTS) return;
   await sendChannel(msg, "intel");
   await sendDiscord(DISCORD_WEBHOOK_INTEL, msg);
 }
@@ -3054,6 +3094,145 @@ function narrativeHasChanged(sectors, stockMovers, cryptoMovers, lseMovers = [])
   return shouldPost;
 }
 
+// ── Intel League Table ───────────────────────────────────────────
+// Top 5 stocks + top 5 coins by APPEARANCES: the number of different days in the last 30 a name showed up as a
+// (rising) mover or a week/month top performer. It measures persistence of attention, not a buy signal.
+const INTEL_LEAGUE = process.env.INTEL_LEAGUE !== "0";
+const LEAGUE_DAYS = 30;
+let intelSeenDay = "";
+const intelSeen = new Set();
+function intelDedupe(rows) {
+  const day = new Date().toISOString().slice(0, 10);
+  if (intelSeenDay !== day) { intelSeen.clear(); intelSeenDay = day; }
+  return rows.filter(r => { const k = `${r.category}|${r.symbol || ""}|${r.tag || ""}`; if (intelSeen.has(k)) return false; intelSeen.add(k); return true; });
+}
+async function leagueFetchRows() {
+  const since = new Date(Date.now() - LEAGUE_DAYS * 86400000).toISOString();
+  const out = [];
+  for (let from = 0; from < 20000; from += 1000) { // PostgREST caps a response at ~1000 rows, so page
+    const { data, error } = await supabase.from("intel_history").select("created_at,category,symbol,tag,change_pct").gte("created_at", since).not("symbol", "is", null).order("created_at", { ascending: false }).range(from, from + 999);
+    if (error) throw new Error(error.message);
+    out.push(...(data || []));
+    if (!data || data.length < 1000) break;
+  }
+  return out;
+}
+// Counting definition (frozen, "v1"): per name over the trailing 30 calendar days, DAYS on each list.
+//   daily   = days it was a rising daily mover       weekly  = days it was in that day's weekly top-performer list
+//   monthly = days it was in the monthly list        any     = days with at least one appearance (the LIVE ranking)
+// weighted_score_v1 = 0.25*daily + 0.50*weekly + 0.25*monthly is STORED for later testing only; it never changes the ranking or the picker.
+function leagueBuild(rows) {
+  const clsOf = { US_MOVER: "stock", LSE_MOVER: "stock", TOP_US: "stock", CRYPTO_MOVER: "crypto", TOP_CRYPTO: "crypto" };
+  const map = new Map();
+  for (const r of rows) {
+    const cls = clsOf[r.category]; if (!cls || !r.symbol) continue;
+    const isMover = /_MOVER$/.test(r.category);
+    const pct = r.change_pct == null ? null : Number(r.change_pct);
+    if (isMover && pct != null && !(pct > 0)) continue; // only rising movers count
+    const list = isMover ? "daily" : (r.tag === "month" ? "monthly" : r.tag === "week" ? "weekly" : null);
+    if (!list) continue;
+    const sym = String(r.symbol).replace(/USDT$/, "");
+    const key = `${cls}:${sym}`;
+    const e = map.get(key) || { cls, sym, daily: new Set(), weekly: new Set(), monthly: new Set(), any: new Set(), last: "", first: "" };
+    const day = String(r.created_at).slice(0, 10);
+    e[list].add(day); e.any.add(day);
+    if (String(r.created_at) > e.last) e.last = String(r.created_at);
+    if (!e.first || day < e.first) e.first = day;
+    map.set(key, e);
+  }
+  const all = [...map.values()].map(e => {
+    const d = e.daily.size, w = e.weekly.size, m = e.monthly.size;
+    return { cls: e.cls, sym: e.sym, daily: d, weekly: w, monthly: m, n: e.any.size, score: Math.round((0.25 * d + 0.5 * w + 0.25 * m) * 100) / 100, first: e.first, last: e.last };
+  });
+  const rank = cls => all.filter(e => e.cls === cls).sort((a, b) => b.n - a.n || (b.last > a.last ? 1 : b.last < a.last ? -1 : 0) || a.sym.localeCompare(b.sym));
+  return { all, stockAll: rank("stock"), cryptoAll: rank("crypto"), stock: rank("stock").slice(0, 5), crypto: rank("crypto").slice(0, 5), firstDay: rows.length ? String(rows[rows.length - 1].created_at).slice(0, 10) : null };
+}
+async function leagueSaveSnapshot(lg) {
+  if (!supabaseEnabled || !lg.all.length) return;
+  const asOf = getUkDateString();
+  const payload = lg.all.map(e => ({ as_of_date: asOf, symbol: e.sym, asset_class: e.cls, daily_list_days: e.daily, weekly_list_days: e.weekly, monthly_list_days: e.monthly, any_list_days: e.n, weighted_score_v1: e.score, first_appearance_in_window: e.first || null, last_appearance_in_window: e.last ? e.last.slice(0, 10) : null }));
+  const { error } = await retry(() => supabase.from("intel_persistence_daily").upsert(payload, { onConflict: "as_of_date,symbol,asset_class" }));
+  if (error) throw new Error(`snapshot: ${error.message}`);
+  log(`📚 Persistence snapshot saved: ${payload.length} names (${asOf})`);
+}
+// Records what Intel saw, EVERY pool refresh (independent of whether any post is made): rising daily movers each time,
+// and week/month top-performer lists (top 20 stocks / top 10 coins) every 4h. One row per name/list/day.
+let lastIntelListsAt = 0;
+async function recordIntel({ topMovers = [], stockMoverPcts = {}, cryptoMovers = [], lseMovers = [] }) {
+  const rows = [];
+  for (const sym of topMovers) { const p = stockMoverPcts[sym]; if (p == null || p > 0) rows.push({ category: "US_MOVER", symbol: sym, tag: "daily", change_pct: p ?? null }); }
+  for (const c of cryptoMovers) if (c.changePct > 0) rows.push({ category: "CRYPTO_MOVER", symbol: c.symbol, tag: "daily", change_pct: c.changePct });
+  for (const m of lseMovers) rows.push({ category: "LSE_MOVER", symbol: m.sym, tag: "daily", change_pct: m.changePct });
+  try { // discovery ledger (unchanged behaviour: rising movers count as flagged)
+    for (const r of rows) {
+      if (r.category === "US_MOVER") await ledgerFlag(r.symbol, "stock", "intel");
+      else if (r.category === "CRYPTO_MOVER") await ledgerFlag(r.symbol, "crypto", "intel");
+    }
+  } catch (e) { log(`⚠️ Ledger (movers) failed: ${e.message}`); }
+  if (Date.now() - lastIntelListsAt >= TOP_PERFORMERS_INTERVAL_MS) {
+    lastIntelListsAt = Date.now();
+    try {
+      const [usPerf, cryptoPerf] = await Promise.all([
+        isWeekend() ? Promise.resolve(null) : (async () => { // stock lists only on trading days, so "list-days" are comparable
+          const hist = await pickerFetchStockDaily(PERFORMANCE_UNIVERSE_US.filter(x => !x.includes(".")));
+          return getTopPerformers(Object.keys(hist), sym => (hist[sym] || []).map(b => ({ time: b.t, close: b.c })), 20);
+        })(),
+        getTopPerformers(CRYPTO_PAIRS, fetchCryptoDailyWithFallback, 10)
+      ]);
+      const add = (cat, list, field, tag) => { for (const r of list || []) if (r[field] > 0) rows.push({ category: cat, symbol: r.symbol, tag, change_pct: r[field] }); };
+      if (usPerf) { add("TOP_US", usPerf.week, "week", "week"); add("TOP_US", usPerf.month, "month", "month"); }
+      add("TOP_CRYPTO", cryptoPerf.week, "week", "week"); add("TOP_CRYPTO", cryptoPerf.month, "month", "month");
+      // ledger: only the top 5 week/month leaders count as "flagged" (YTD excluded) -- unchanged behaviour
+      if (usPerf) for (const r of [...usPerf.week.slice(0, 5), ...usPerf.month.slice(0, 5)]) if (r.week > 0 || r.month > 0) await ledgerFlag(r.symbol, "stock", "intel");
+      for (const r of [...cryptoPerf.week.slice(0, 5), ...cryptoPerf.month.slice(0, 5)]) if (r.week > 0 || r.month > 0) await ledgerFlag(r.symbol, "crypto", "intel");
+    } catch (e) { log(`⚠️ Intel lists failed: ${e.message}`); }
+  }
+  const toWrite = intelDedupe(rows);
+  if (supabaseEnabled && toWrite.length) {
+    try {
+      const { error } = await retry(() => supabase.from("intel_history").insert(toWrite));
+      if (error) log(`⚠️ Intel history insert error: ${error.message}`);
+    } catch (e) { log(`⚠️ Intel history insert failed: ${e.message}`); }
+  }
+}
+async function intelLeagueDaily() {
+  if (!supabaseEnabled) return;
+  const rows = await leagueFetchRows();
+  const lg = leagueBuild(rows);
+  await leagueSaveSnapshot(lg).catch(e => log(`⚠️ Persistence snapshot failed: ${e.message}`));
+  if (!INTEL_LEAGUE) return;
+  const led = await ledgerLoad().catch(() => null);
+  const today = new Date().toISOString().slice(0, 10);
+  const seen = e => { const d = Math.round((new Date(today) - new Date(e.last.slice(0, 10))) / 86400000); return d <= 0 ? "today" : d === 1 ? "yesterday" : `${d}d ago`; };
+  const since = e => { const r = led?.get(ledgerKey(e.cls, e.sym)); const v = r ? ledgerSinceDiscovery(r) : null; return v == null ? "" : ` · since first noticed ${v >= 0 ? "+" : ""}${(v * 100).toFixed(0)}%`; };
+  const row = (e, i) => `${i + 1}. <b>${escapeHtml(e.sym)}</b> — ${e.n} day${e.n === 1 ? "" : "s"} (mover ${e.daily} · week-list ${e.weekly} · month-list ${e.monthly}) · last seen ${seen(e)}${since(e)}`;
+  const S = [`🏆 <b>INTEL LEAGUE TABLE — STOCKS</b> · most appearances, last ${LEAGUE_DAYS} days`, `<i>Ranked by days with at least one appearance: rising daily mover, or in the week/month top-performer list.</i>`, ""];
+  if (lg.stock.length) lg.stock.forEach((e, i) => S.push(row(e, i))); else S.push("none yet");
+  const C = [`🏆 <b>INTEL LEAGUE TABLE — CRYPTO</b> · most appearances, last ${LEAGUE_DAYS} days`, ""];
+  if (lg.crypto.length) lg.crypto.forEach((e, i) => C.push(row(e, i))); else C.push("none yet");
+  C.push("");
+  C.push(`<i>Tracking began ${lg.firstDay || "—"}, so counts build over time. Appearances show persistence, not a buy signal — the picker decides buys. "Since first noticed" is the move since Intel first flagged it, not a trade return.</i>`);
+  await sendPrivate(S.join("\n"), "intel");
+  await sleep(1000);
+  await sendPrivate(C.join("\n"), "intel");
+}
+// Once a day from 08:30 UK (any day), and once shortly after the first start so the format can be seen straight away.
+function startIntelLeague() {
+  const tick = async () => {
+    try {
+      const today = getUkDateString();
+      const { hour, minute } = getUkNowParts();
+      const due = pickerState.lastLeagueDate !== today && (!pickerState.lastLeagueDate || Number(hour) > 8 || (Number(hour) === 8 && Number(minute) >= 30));
+      if (!due) return;
+      pickerState.lastLeagueDate = today;
+      await pickerSaveState();
+      await intelLeagueDaily();
+    } catch (e) { log(`⚠️ Intel league failed: ${e.message}`); }
+  };
+  setTimeout(() => void tick(), 150 * 1000);
+  setInterval(() => void tick(), 10 * 60 * 1000);
+}
+
 // ── Narrative alert ──────────────────────────────────────────────
 async function sendNarrativeAlert(topMovers, cryptoMovers, stockMoverPcts = {}, lseMovers = []) {
   if (!Array.isArray(topMovers))    topMovers    = [];
@@ -3193,7 +3372,7 @@ async function sendNarrativeAlert(topMovers, cryptoMovers, stockMoverPcts = {}, 
   // early-return below on purpose). Day/week/month/YTD figures don't
   // move much hour to hour, but "day" genuinely evolves through the
   // session, and readers asked for more frequent updates than once/day.
-  if (Date.now() - lastTopPerformersAt >= TOP_PERFORMERS_INTERVAL_MS) {
+  if (ROUTINE_ALERTS && Date.now() - lastTopPerformersAt >= TOP_PERFORMERS_INTERVAL_MS) { // message-only now; recordIntel() owns the data
     lastTopPerformersAt = Date.now();
     saveIntelState();
     try {
@@ -3250,12 +3429,7 @@ async function sendNarrativeAlert(topMovers, cryptoMovers, stockMoverPcts = {}, 
   // V102: persist to intel_history -- real record of what Intel actually
   // flagged, so retrospective questions ("did this later become a real
   // signal") become answerable instead of only living in chat history.
-  if (supabaseEnabled && intelRows.length > 0) {
-    try {
-      const { error } = await retry(() => supabase.from("intel_history").insert(intelRows));
-      if (error) log(`⚠️ Intel history insert error: ${error.message}`);
-    } catch (e) { log(`⚠️ Intel history insert failed: ${e.message}`); }
-  }
+  // (Recording to intel_history now lives in recordIntel(), which runs every pool refresh whether or not a post is made.)
 
   // Discord routing kept (delivery infrastructure, added this session -- not intel content/logic)
   await safeRun("telegramNarrative", () => sendIntelChannels(lines(parts)));
@@ -3304,8 +3478,10 @@ async function refreshDynamicPools(forceNarrativeAlert = false) {
       STOCK_POOL = dedup([...ALWAYS_SCAN_STOCKS, ...trendingStocks, ...topMovers, ...sectorInjected]).slice(0, 60);
       log(`✅ Pools -- Crypto: ${CRYPTO_PAIRS.length}, Stocks: ${STOCK_POOL.length}, LSE movers: ${lseMovers.length}`);
 
+      const cryptoMoversAll = await getCryptoMovers();
+      await safeRun("recordIntel", () => recordIntel({ topMovers, stockMoverPcts, cryptoMovers: cryptoMoversAll, lseMovers }));
       if (shouldSendStockAlerts()) {
-        const cryptoMovers = await getCryptoMovers();
+        const cryptoMovers = cryptoMoversAll;
         if (forceNarrativeAlert || narrativeHasChanged(HOT_SECTORS, topMovers, cryptoMovers, lseMovers)) {
           if (forceNarrativeAlert) {
             // Market open force -- reset timer so it posts immediately
@@ -3318,6 +3494,7 @@ async function refreshDynamicPools(forceNarrativeAlert = false) {
     } else {
       log(`✅ Weekend -- Crypto: ${CRYPTO_PAIRS.length} pairs`);
       const cryptoMovers = await getCryptoMovers();
+      await safeRun("recordIntel", () => recordIntel({ cryptoMovers }));
       if (forceNarrativeAlert || (narrativeHasChanged([],[],cryptoMovers,[]) && shouldSendCryptoAlerts())) {
         await sendNarrativeAlert([], cryptoMovers);
       }
@@ -7347,7 +7524,8 @@ async function scan() {
     // downstream (momentum/EMA gates) regardless of what gets scanned.
     // REVERT to the line below once tested:
     // const breadthOk = checkedPairs < 5 || (greenPairs / checkedPairs) >= 0.30;
-    const breadthOk = true;
+    // Put back to normal (the 23 Aug test is over). BREADTH_GATE=0 in Railway disables the gate again without a redeploy of code.
+    const breadthOk = process.env.BREADTH_GATE === "0" ? true : (checkedPairs < 5 || (greenPairs / checkedPairs) >= 0.30);
     global.lastCryptoBreadthCount = greenPairs; // V100: expose to analyse() for BROAD_MOMENTUM setup
     if (!breadthOk) {
       // V101 FIX: weak breadth used to skip the ENTIRE crypto scan, silencing
@@ -7446,12 +7624,30 @@ async function processSignals(signals) {
   const trades = await loadTradesCached();
 
   for (const signal of signals) {
-    const existingOpenTrade = getOpenTradeInMarket(trades, signal.market);
-    if (existingOpenTrade) {
-      const livePrice = await fetchLivePrice(existingOpenTrade.asset, existingOpenTrade.market);
-      if (shouldReplaceTrade(signal, existingOpenTrade, livePrice)) {
-        await closeTrade(trades, existingOpenTrade, Number.isFinite(livePrice)?livePrice:existingOpenTrade.entry, "REPLACED");
-      } else { continue; }
+    // FIX D: open trades used to be handled wrongly in two ways. (1) ANY single open trade in a market blocked every
+    // new signal there, even with free slots (MSTR open => NVDA/AVGO never sent). (2) A new crypto signal could close an
+    // open trade although there was room (CRV/SUI/TIA "replaced" minutes after opening). Now: a free slot just opens;
+    // replacement happens only when the market is FULL, never inside a minimum age, and never two positions in one asset.
+    if (trades.some(t => t.asset === signal.asset && (t.status === "PENDING" || (t.status === "FILLED" && t.outcome === "OPEN")))) {
+      log(`⏳ ${signal.asset} skipped: already has an open or pending trade`);
+      continue;
+    }
+    const openInMarket = trades.filter(t => t.market === signal.market && t.status === "FILLED" && t.outcome === "OPEN");
+    const maxPos = MAX_POSITIONS[signal.market] ?? 1;
+    if (openInMarket.length >= maxPos) {
+      const minAgeH = signal.market === "CRYPTO" ? REPLACE_MIN_AGE_HOURS_CRYPTO : REPLACE_MIN_AGE_HOURS_STOCK;
+      let victim = null, victimPrice = NaN;
+      for (const t of openInMarket) {
+        if (hoursAgo(t.filledAt || t.sentAt) < minAgeH) continue;
+        const lp = await fetchLivePrice(t.asset, t.market);
+        if (shouldReplaceTrade(signal, t, lp) && (!victim || (t.score || 0) < (victim.score || 0))) { victim = t; victimPrice = lp; }
+      }
+      if (!victim) {
+        log(`⏳ ${signal.asset} skipped: ${signal.market} full (${openInMarket.length}/${maxPos}: ${openInMarket.map(t => t.asset).join(", ")}) and none can be replaced (needs a ${REPLACEMENT_SCORE_GAP}+ point better score, a stalled trade, and >= ${minAgeH}h open)`);
+        continue;
+      }
+      log(`🔄 ${signal.asset} replaces ${victim.asset} (${signal.market} full)`);
+      await closeTrade(trades, victim, Number.isFinite(victimPrice) ? victimPrice : victim.entry, "REPLACED");
     }
 
     if (countOpenTradesByMarket(trades,signal.market) >= MAX_POSITIONS[signal.market]) continue;
@@ -8164,6 +8360,9 @@ const PICKER_MAX_EXT_SMA20 = 1.18; // skip assets >18% above SMA20 (don't chase)
 // Liquidity floor. The daily bars come from Alpaca's free IEX feed, which carries only a few percent of real
 // trading volume, so the old 20e6 floor (meant as ~$20M/day of REAL trading) rejected liquid names (MRNA: 126 "illiquid" days
 // in the backtest). 1e6 of IEX dollar volume is roughly $25-50M+ of real daily trading. Override with PICKER_MIN_DOLLAR_VOL.
+// Position sizing display uses YOUR risk setting: RISK_PCT (1 or 0.01 both mean 1%) and optional ACCOUNT_SIZE (shows an amount).
+const RISK_PCT_USE = (() => { const v = Number(process.env.RISK_PCT); return v > 0 ? (v <= 0.2 ? v * 100 : v) : 1; })();
+const ACCOUNT_SIZE_USE = Number(process.env.ACCOUNT_SIZE) > 0 ? Number(process.env.ACCOUNT_SIZE) : 0;
 const PICKER_MIN_DOLLAR_VOL = Number(process.env.PICKER_MIN_DOLLAR_VOL || 1e6);
 const PICKER_MAX_5D_RET   = 0.30;  // skip assets already +30% in 5 days
 
@@ -9022,7 +9221,7 @@ async function runPicker(reason = "scheduled") {
             L.push(`• <b>Relative strength:</b> up ${pc(cur.r63)} in 3 months vs ${cur.benchName} ${pc(cur.b63)} — it is beating the market, which is where outsized gains come from.`);
             L.push(`• <b>Not chasing:</b> only ${pc(cur.ext)} above its 20-day average (we skip anything 18%+ stretched; those usually pull back).`);
             L.push(`• <b>Momentum:</b> 1m ${pc(cur.r21)} · 3m ${pc(cur.r63)} · 6m ${pc(cur.r126)}`);
-            L.push(`• <b>Risk plan:</b> stop at ${pkFmt(cur.stop)} (${(cur.riskPct * 100).toFixed(1)}% below, 2.5× the normal daily range). If it gets there the idea is wrong — leave. Sizing: to risk 1% of your account, hold about ${(1 / Math.max(cur.riskPct * 100, 0.1) * 100).toFixed(0)}% of it in this position.`);
+            L.push(`• <b>Risk plan:</b> stop at ${pkFmt(cur.stop)} (${(cur.riskPct * 100).toFixed(1)}% below, 2.5× the normal daily range). If it gets there the idea is wrong — leave. Sizing: to risk ${RISK_PCT_USE}% of your account, hold about ${Math.min(100, RISK_PCT_USE / Math.max(cur.riskPct * 100, 0.1) * 100).toFixed(0)}% of it${ACCOUNT_SIZE_USE ? ` (~${Math.round(ACCOUNT_SIZE_USE * Math.min(1, RISK_PCT_USE / Math.max(cur.riskPct * 100, 0.1))).toLocaleString("en-GB")})` : ""} in this position.`);
             if (earningsSoon.has(p.sym)) L.push("• ⚠️ Earnings are due within 5 days — price can gap either way.");
           } else {
             const toStop = cur ? (cur.price - p.stop) / cur.price : 0;
@@ -9053,6 +9252,7 @@ async function runPicker(reason = "scheduled") {
       L.push(`   <i>${lesson}</i>`);
       L.push("");
     }
+    if (picks.length) L.push(`🧮 <b>Total risk:</b> ${picks.length} position${picks.length === 1 ? "" : "s"} × ${RISK_PCT_USE}% = up to ${(picks.length * RISK_PCT_USE).toFixed(1)}% of your account if every stop is hit.`);
     const nav0 = pickerState.nav[0];
     const spyRet = nav0?.spy0 && spy.length ? spy[spy.length - 1] / nav0.spy0 - 1 : null;
     const btcRet = nav0?.btc0 && btc.length ? btc[btc.length - 1] / nav0.btc0 - 1 : null;
@@ -9126,7 +9326,7 @@ function startPicker() {
       const today = getUkDateString();
       if (Number(hour) === PICKER_RUN_UK_HOUR && Number(minute) >= PICKER_RUN_UK_MIN && pickerState.lastRunDate !== today) void runPicker("scheduled");
     }, 5 * 60 * 1000);
-    log(`🧭 Picker armed -- runs daily ${PICKER_RUN_UK_HOUR}:${String(PICKER_RUN_UK_MIN).padStart(2, "0")} UK, Telegram DM + private channel, no Discord (${CHAT_ID ? "DM configured" : "NO CHAT_ID -- logs only"})`);
+    log(`🧭 Picker armed -- runs daily ${PICKER_RUN_UK_HOUR}:${String(PICKER_RUN_UK_MIN).padStart(2, "0")} UK, delivery: ${DISCORD_ENABLED && DISCORD_WEBHOOK_PICKS ? "Discord #picks" : "no Discord picks webhook"}${telegramWanted("picks") ? " + Telegram" : ""}`);
   })();
 }
 
@@ -9170,6 +9370,8 @@ server = app.listen(PORT, "0.0.0.0", async () => {
   // V100: Start priority scanning loops
   setTimeout(() => void sniperLoop(), 5000);  // Sniper starts 5s after boot
   setTimeout(() => void warmLoop(),   10000); // Warm starts 10s after boot
+  setTimeout(() => void safeRun("discordSelfCheck", discordSelfCheck), 20 * 1000); // verify webhooks after keys are rotated
   startPicker();
+  startIntelLeague();
   log("🎯 V100 Sniper Engine armed -- HOT loop: 12s | WARM loop: 30s | Open Mode: 8s");
 });

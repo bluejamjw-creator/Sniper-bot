@@ -76,6 +76,10 @@ const CONFIG = {
   maxWatchPostsPerDay: Number(env('TREND_WATCH_MAX_POSTS_DAY', 12)),
   leaderboardRetentionDays: 21,
   concurrency: 3,
+  // V16.3: quiet mode — watchlist and momentum events are recorded, not posted;
+  // stops are fixed at entry (never raised). HUNTER_QUIET=off / TREND_TRAIL=on restore them.
+  quiet: process.env.HUNTER_QUIET !== 'off',
+  trailStops: process.env.TREND_TRAIL === 'on',
 };
 
 const PM = {
@@ -952,6 +956,7 @@ async function watchPost(text) {
   if (STATE.watchPosts.day !== day) STATE.watchPosts = { day, n: 0 };
   if (STATE.watchPosts.n >= CONFIG.maxWatchPostsPerDay) return false;
   STATE.watchPosts.n++;
+  if (CONFIG.quiet) { log(`(quiet) ${text.split('\n')[0]}`); return true; }
   await NOTIFY(text);
   return true;
 }
@@ -1041,7 +1046,7 @@ async function checkMomentumEvents(candidates) {
     if (STATE.momentumSent.has(key)) continue;
     STATE.momentumSent.add(key);
     const t = c.assetType;
-    await NOTIFY([`🚨 MOMENTUM EVENT — ${flagOf(t)} ${labelOf(c.symbol)}`, '',
+    if (!CONFIG.quiet) await NOTIFY([`🚨 MOMENTUM EVENT — ${flagOf(t)} ${labelOf(c.symbol)}`, '',
       `Up ${round2(move)}% since the last scan (${fmtPx(prior.price, t)} → ${fmtPx(c.price, t)}).`,
       `Hunter score: ${round2(c.finalScore)}`, sectorLine(c.symbol), '',
       'A large abnormal move, not a standard OPEN signal. Tracked for 24h.'].filter(Boolean).join('\n'));
@@ -1154,7 +1159,7 @@ function pmEvaluateCloseTriggers(position, candles, currentScore, peakInPosition
   const inGrace = (Date.now() - new Date(position.opened_at).getTime()) / 86400000 < PM.HOLD_NEW_POSITION_GRACE;
   if (pmIsLowVolumePullback(candles, 5)) return { close: false, evidence: { ...ev, lowVolPullback: true } };
   const trendIntact = ma20 && ma50 && ma20 > ma50;
-  if (position.atr_stop && last < Number(position.atr_stop)) return { close: true, reason: 'ATR trailing stop breached', trigger: 'ATR_STOP', evidence: ev };
+  if (position.atr_stop && last < Number(position.atr_stop)) return { close: true, reason: 'Stop hit', trigger: 'ATR_STOP', evidence: ev };
   if (ma50 && last < ma50 * (1 - PM.HOLD_MA50_BUFFER_PCT / 100) && pmCountDistributionDays(candles, 5) >= 2 && !trendIntact) {
     return { close: true, reason: `Price ${round2(((ma50 - last) / ma50) * 100)}% below the 50-day average on selling`, trigger: 'MA50_BREAK', evidence: ev };
   }
@@ -1220,9 +1225,10 @@ function openMessage(symbol, type, score, price, reasons, atrStop, swingLow) {
     `Hunter score: ${round2(score)}`,
     sectorLine(symbol) || null, '',
     'Why Hunter likes it:', ...best.map(r => `· ${r}`), '',
-    stop ? `Exit if it drops below ${fmtPx(stop, type)} (${round2(((price - stop) / price) * 100)}% below entry). Hunter checks every scan and raises the stop as the trend runs.` : null,
+    stop ? `Exit if it drops below ${fmtPx(stop, type)} (${round2(((price - stop) / price) * 100)}% below entry). Hunter checks this every scan; the stop stays fixed.` : null,
     atrStop && swingLow ? `(ATR stop ${fmtPx(atrStop, type)} · swing low ${fmtPx(swingLow, type)})` : null,
-    'A hold-for-the-trend position: you will only hear again on a CLOSE.', '', DISCLAIMER,
+    'A hold-for-the-trend position: you will only hear again on a CLOSE.',
+    ...require('./fun_money.js').openLines('trend', stop ? (price - stop) / price : NaN, null), '', DISCLAIMER,
   ].filter(x => x !== null).join('\n');
 }
 
@@ -1234,7 +1240,8 @@ function closeMessage(pos, price, reason, ret) {
     `Why: ${reason}`,
     `Entry ${fmtPx(Number(pos.entry_price), t)} → exit ${fmtPx(price, t)}${ret != null ? ` (${ret >= 0 ? '+' : ''}${ret}%)` : ''}`,
     `Held ${days} day${days === 1 ? '' : 's'}.`, '',
-    'No action needed until the next OPEN.', '', DISCLAIMER,
+    'No action needed until the next OPEN.',
+    ...require('./fun_money.js').closeLines('trend', ret != null ? Number(ret) / 100 : NaN), '', DISCLAIMER,
   ].join('\n');
 }
 
@@ -1262,7 +1269,7 @@ async function checkOpenPositionStops() {
     if (!(Number(pos.max_price) >= px)) patch.max_price = px;
     if (!(Number(pos.min_price) <= px)) patch.min_price = px;
     const atr = Number(pos.atr_stop), swing = Number(pos.swing_low_stop);
-    const hit = atr > 0 && px < atr ? `ATR trailing stop breached (${fmtPx(atr, pos.asset_type)})`
+    const hit = atr > 0 && px < atr ? `Stop hit (${fmtPx(atr, pos.asset_type)})`
       : swing > 0 && px < swing ? `Swing low broken (${fmtPx(swing, pos.asset_type)})` : null;
     if (hit) {
       log(`stop hit ${pos.symbol} @ ${px}: ${hit}`);
@@ -1300,7 +1307,7 @@ async function runPortfolioManager() {
     const current = snaps.length ? snaps.at(-1).score : null;
     const peak = Math.max(Number(pos.peak_score || pos.entry_score || 0), ...snaps.map(s => s.score));
     const candles = await fetchDailyCandles(pos.symbol, pos.asset_type);
-    if (candles.length >= 15) {
+    if (CONFIG.trailStops && candles.length >= 15) {
       const atr = pmATR(candles, 14);
       if (atr) {
         const newStop = roundPrice(candles.at(-1).close - atrMultFor(pos.asset_type) * atr);

@@ -1,5 +1,5 @@
 /**
- * portfolio-bot-v8.js — HUNTER V16.2 🏹
+ * portfolio-bot-v8.js — HUNTER V16.3 🏹
  *
  * Built on V14.2 (unchanged: scoring, universe, Revolut filter, learning,
  * late-entry veto, -14% / +20% bracket). Changes, each switchable:
@@ -35,6 +35,17 @@
  * 8. HORSE PICKS (V16.1) — horse_picks.js (same folder): UK/IRE racing via The
  *    Racing API. Paper phase by default (field audit + tracked picks, no posts);
  *    HORSE_POSTS=on posts to DISCORD_WEBHOOK_HORSES. Own tables (horse_*).
+ * 10. V16.3 (29 Oct) — FIXED STOPS + STRICTER ENTRY + QUIET MODE.
+ *    - No moving stops: the profit-lock ladder is off (fixed −14% / +20% bracket),
+ *      the stocks lane no longer raises its stop. HUNTER_STOP_LADDER brings it back.
+ *    - Stricter crypto entry (audit of 1,513 resolved detections, 23–29 Oct):
+ *      the current gate hit +10% before −7% in 29% of resolved cases (break-even
+ *      for +10/−7 is 41%). Adding ATR ≥ 1% (the coin actually moves) and a 24h
+ *      gain of 4–10% (already moving, not late) lifted that to 46% on a small
+ *      sample (24). HUNTER_ENTRY_FILTER=off reverts.
+ *    - Quiet mode: only OPEN, CLOSE and weekly summaries are posted. Stop-raised,
+ *      milestone, watchlist, momentum and daily end-of-day posts are recorded
+ *      but not sent. HUNTER_QUIET=off restores them.
  * 9. FOOTY PICKS (V16.2) — football_picks.js (same folder): value singles (1X2)
  *    for European leagues, UEFA cups and internationals. Coverage audit +
  *    walk-forward backtest; paper phase by default; FOOTY_POSTS=on posts
@@ -798,15 +809,11 @@ const CONFIG = {
         return v.slice().sort((a, b) => a.at - b.at);
       }
     } catch (e) { /* fall through to default */ }
-    return [
-      { at: 5, lockPct: 2 },
-      { at: 10, lockPct: 5 },
-      { at: 15, lockPct: 9 },
-      { at: 20, lockPct: 13 },
-      { at: 30, lockPct: 20 },
-      { at: 40, lockPct: 28 },
-    ];
+    return []; // V16.3: fixed bracket — the stop is set at entry and never moved
   })(),
+  // V16.3: stricter entry from the 29 Oct audit (see header). Env HUNTER_ENTRY_FILTER=off reverts.
+  entryFilter: { enabled: process.env.HUNTER_ENTRY_FILTER !== 'off', minAtrPct: 0.01, minRet24h: 0.04 },
+  quiet: process.env.HUNTER_QUIET !== 'off',
   // LIVE (12 Oct): late-entry veto. Skip any coin already up more than
   // `ret24hMax` over the last 24h. Replay (SL -14 / TP +20): signals up
   // 10-20% averaged -1.7% per trade and >20% averaged -8.0%, versus
@@ -941,7 +948,7 @@ const CFG = {
   maxOpen: 2,
   maxNewPerCycle: 1,
   maxQuoteAgeMs: 30 * 60 * 1000,   // a quote older than this is not 'now' (e.g. Friday's close on Monday)
-  lockAtPct: 5, lockPct: 2,
+  lockAtPct: process.env.HUNTER_STOP_LADDER ? 5 : Infinity, lockPct: 2, // V16.3: fixed stop unless the ladder is re-enabled
   slMinPct: 3, slMaxPct: 8, slRangeMult: 1.5, tpR: 4,
   eodHourUtc: 21, eodMinute: 10,
 };
@@ -1231,6 +1238,7 @@ async function trackSignals(db, quotes, notify = async () => {}) {
           `Held: ${Math.floor((now - new Date(s.signaled_at)) / 3600000)}h | Peak: ${fmtPct((maxP / s.ref_price - 1) * 100)}`,
           '', `Reason: ${closeReason}`, '',
           "Based on Hunter's own polled price — check Revolut for your actual fill.",
+          ...require('./fun_money.js').closeLines('stocks', mv / 100),
         ].join('\n'));
         continue;
       }
@@ -1256,7 +1264,7 @@ async function trackSignals(db, quotes, notify = async () => {}) {
         const level = [75, 50, 25].find(l => prog >= l && l > done);
         if (level) {
           patch.tp_milestone = level;
-          await notify([
+          if (process.env.HUNTER_QUIET === 'off') await notify([
             `🎯 HUNTER STOCKS TP MILESTONE — ${level}% of the way`, '', s.symbol,
             `Entry: ${fmtP(s.ref_price)}`, `Now: ${fmtP(px)} (${fmtPct((px / s.ref_price - 1) * 100)})`,
             `TP: ${fmtP(s.tp_price)}`, `SL: ${fmtP(s.sl_price)}`, '',
@@ -1280,7 +1288,7 @@ async function trackSignals(db, quotes, notify = async () => {}) {
         else {
         patch.close_reason = 'TIMEOUT (14d)'; patch.close_price = last; patch.closed_at = now.toISOString();
         await notify(['⏹ HUNTER STOCKS CLOSE', '', s.symbol, `Entry: ${fmtP(s.ref_price)}`, `Exit: ${fmtP(last)}`,
-          `Move: ${fmtPct((last / s.ref_price - 1) * 100)}`, '', 'Reason: TIMEOUT (14 days held, neither SL nor TP hit)'].join('\n'));
+          `Move: ${fmtPct((last / s.ref_price - 1) * 100)}`, '', 'Reason: TIMEOUT (14 days held, neither SL nor TP hit)', ...require('./fun_money.js').closeLines('stocks', last / s.ref_price - 1)].join('\n'));
         }
       }
     }
@@ -1353,6 +1361,7 @@ async function detectSignals(db, quotes, notify = async () => {}) {
       `TP: ${fmtP(tpPx)} (+${tpPct.toFixed(1)}%)`, '',
       `Day: ${fmtPct(c.dayChange)} | near the day's high (${Math.round(c.rangePos * 100)}% of range)`,
       '', "US stocks, Hunter's own polled price (Finnhub). Check Revolut for the live price before acting.",
+      ...require('./fun_money.js').openLines('stocks', slPct / 100, tpPct / 100),
     ].join('\n'));
     console.log(`[STOCK-SHADOW] signal ${c.symbol} @ ${c.q.price} (day ${c.dayChange.toFixed(1)}%)`);
   }
@@ -1412,7 +1421,7 @@ function start(db, opts = {}) {
       try {
         const nowD = new Date();
         if (nowD.getUTCDay() >= 1 && nowD.getUTCDay() <= 5 && nowD.getUTCHours() === CFG.eodHourUtc && nowD.getUTCMinutes() >= CFG.eodMinute) {
-          await eodReport(db, notify);
+          if (process.env.HUNTER_QUIET === 'off') await eodReport(db, notify);
         }
         if (usMarketWindow()) {
           const n = await runCycle(db, key, symbols, state, opts.fetcher, notify);
@@ -5483,6 +5492,10 @@ function openCandidate(detection, btcRisk) {
 
   const reasons = [];
   if (detection.creamScore < CONFIG.creamMinScore) reasons.push('score below 70');
+  if (CONFIG.entryFilter.enabled) {
+    if (!(num(f.atrPct, 0) >= CONFIG.entryFilter.minAtrPct)) reasons.push(`ATR ${(num(f.atrPct, 0) * 100).toFixed(2)}% < ${CONFIG.entryFilter.minAtrPct * 100}% (too quiet)`);
+    if (!(num(f.ret24h, 0) >= CONFIG.entryFilter.minRet24h)) reasons.push(`24h ${(num(f.ret24h, 0) * 100).toFixed(1)}% < ${CONFIG.entryFilter.minRet24h * 100}% (not moving yet)`);
+  }
   if (lateCheck.tooLate) reasons.push(lateCheck.reason);
   if (readiness.signalCount < CONFIG.alertMinSignals) {
     reasons.push(`only ${readiness.signalCount}/${CONFIG.alertMinSignals} alert signals`);
@@ -5902,6 +5915,7 @@ async function openPosition(
       `TP: +${levels.takeProfitPct}% → ${formatPrice(levels.takeProfitPrice)}  |  ${levels.riskReward}R`,
       ``,
       `Score: ${detection.creamScore.toFixed(0)} • ${detection.stage}`,
+      ...require('./fun_money.js').openLines('crypto', Math.abs(levels.stopLossPct) / 100, levels.takeProfitPct / 100),
     ].join('\n');
 
   await insertAlert(
@@ -6150,6 +6164,7 @@ async function closePosition(
       `24h: ${pct(f.ret24h).toFixed(1)}%`,
       ``,
       `Based on Hunter's own price feed — check Revolut for your actual fill, they can differ.`,
+      ...require('./fun_money.js').closeLines('crypto', move),
     ].join('\n');
 
   await insertAlert(
@@ -6353,7 +6368,7 @@ async function evaluateOpenPosition(
             `Based on Hunter's own price feed — check Revolut for live price.`,
           ].join('\n');
           await insertAlert(detection.symbol, 'STOP_RAISED', msg, detection.detectionId || null, { newStop, lockPct: step.lockPct });
-          await alertUser(msg);
+          if (!CONFIG.quiet) await alertUser(msg);
         }
       }
     }
@@ -6403,7 +6418,7 @@ async function evaluateOpenPosition(
             `Based on Hunter's own price feed — check Revolut for live price.`,
           ].join('\n');
           await insertAlert(detection.symbol, 'TP_MILESTONE', msg, detection.detectionId || null, { level, progress });
-          await alertUser(msg);
+          if (!CONFIG.quiet) await alertUser(msg);
         }
       }
     }
@@ -7553,7 +7568,7 @@ async function runCycle() {
 
     // ADDED: end-of-day open-positions summary (once per day).
     if (now.getUTCHours() === CONFIG.eodReportHourUtc) {
-      try { await generateEodReport(); } catch (e) {
+      if (!CONFIG.quiet) try { await generateEodReport(); } catch (e) {
         console.error(`[HUNTER] EOD report failed: ${e.message}`);
       }
     }
@@ -8329,11 +8344,11 @@ async function startup() {
   );
 
   console.log(
-    'HUNTER V16.2 — CRYPTO EARLY-MOVE + TREND PORTFOLIO LANES + HORSE & FOOTY PICKS'
+    'HUNTER V16.3 — CRYPTO EARLY-MOVE + TREND PORTFOLIO LANES + HORSE & FOOTY PICKS'
   );
 
   console.log(
-    `[HUNTER] Alerts → ${ENV.DISCORD_WEBHOOK ? 'Discord' : 'NONE (set a Discord webhook)'} · stop ladder ${CONFIG.stopLadder.map(r => `+${r.at}→+${r.lockPct}`).join(' ')}`
+    `[HUNTER] Alerts → ${ENV.DISCORD_WEBHOOK ? 'Discord' : 'NONE (set a Discord webhook)'} · ${CONFIG.stopLadder.length ? `stop ladder ${CONFIG.stopLadder.map(r => `+${r.at}→+${r.lockPct}`).join(' ')}` : 'fixed stop (never moved)'} · entry filter ${CONFIG.entryFilter.enabled ? `ATR≥${CONFIG.entryFilter.minAtrPct * 100}% & 24h ${CONFIG.entryFilter.minRet24h * 100}–10%` : 'off'} · ${CONFIG.quiet ? 'quiet mode (OPEN/CLOSE/weekly only)' : 'all alerts'}`
   );
 
   console.log(
@@ -8422,16 +8437,24 @@ async function startup() {
   // V16.1: horse picks (paper phase unless HORSE_POSTS=on).
   if (process.env.HORSE_PICKS !== 'off') {
     try {
-      require('./horse_picks.js').start({ db: supabase });
+      require('./horse_picks.js').start({ db: supabase, notify: alertUser });
     } catch (error) {
       console.error(`[HUNTER] Horse picks not started: ${error.message}`);
     }
   }
 
+  try { const FUN = require('./fun_money.js'); console.log(`[FUN] fun money ${FUN.ON ? 'ON' : 'off'} · pot £${FUN.POT} · stakes crypto £${FUN.stake('crypto')} trend £${FUN.stake('trend')} stocks £${FUN.stake('stocks')} horse £${FUN.stake('horse')} (NAP £${FUN.stake('horseNap')}) football £${FUN.stake('football')}`); } catch (e) { console.error(`[FUN] ${e.message}`); }
+  // V16.3: one-off 12-month replay of crypto entry rules (research only; results in replay_kv).
+  try {
+    require('./crypto_replay.js').start({ db: supabase, universe: () => (STATE.universe || []).map(a => a.symbol) });
+  } catch (error) {
+    console.error(`[HUNTER] Crypto replay not started: ${error.message}`);
+  }
+
   // V16.2: footy picks (paper phase unless FOOTY_POSTS=on).
   if (process.env.FOOTY_PICKS !== 'off') {
     try {
-      require('./football_picks.js').start({ db: supabase });
+      require('./football_picks.js').start({ db: supabase, notify: alertUser });
     } catch (error) {
       console.error(`[HUNTER] Footy picks not started: ${error.message}`);
     }

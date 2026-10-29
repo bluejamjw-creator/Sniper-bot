@@ -38,7 +38,7 @@
 const env = (k, d) => (process.env[k] === undefined || process.env[k] === '' ? d : process.env[k]);
 
 const MODEL = Object.freeze({
-  version: 'v2', // v2: model blended with the market (weight tuned on 2024/25 only), exchange commission, tested on unseen seasons
+  version: 'v2.1', // v2.1: + League One/Two, Scotland, Netherlands, Belgium, Portugal, Turkey, Greece; odds only for passed leagues. v2: v2: model blended with the market (weight tuned on 2024/25 only), exchange commission, tested on unseen seasons
   market: 'h2h (90-minute 1X2)',
   minEV: 0.05,
   fragileShift: 0.03,
@@ -69,6 +69,15 @@ const COMPS = [
   { group: 'DOMESTIC', key: 'soccer_italy_serie_a', label: 'Serie A', fd: 'I1', af: 135 },
   { group: 'DOMESTIC', key: 'soccer_germany_bundesliga', label: 'Bundesliga', fd: 'D1', af: 78 },
   { group: 'DOMESTIC', key: 'soccer_france_ligue_one', label: 'Ligue 1', fd: 'F1', af: 61 },
+  // V2.1: lower / smaller leagues, where bookmakers price less sharply.
+  { group: 'DOMESTIC', key: 'soccer_england_league1', label: 'League One', fd: 'E2', af: 41 },
+  { group: 'DOMESTIC', key: 'soccer_england_league2', label: 'League Two', fd: 'E3', af: 42 },
+  { group: 'DOMESTIC', key: 'soccer_spl', label: 'Scottish Premiership', fd: 'SC0', af: 179 },
+  { group: 'DOMESTIC', key: 'soccer_netherlands_eredivisie', label: 'Eredivisie', fd: 'N1', af: 88 },
+  { group: 'DOMESTIC', key: 'soccer_belgium_first_div', label: 'Belgian Pro League', fd: 'B1', af: 144 },
+  { group: 'DOMESTIC', key: 'soccer_portugal_primeira_liga', label: 'Primeira Liga', fd: 'P1', af: 94 },
+  { group: 'DOMESTIC', key: 'soccer_turkey_super_league', label: 'Super Lig', fd: 'T1', af: 203 },
+  { group: 'DOMESTIC', key: 'soccer_greece_super_league', label: 'Greek Super League', fd: 'G1', af: 197 },
   { group: 'UEFA', key: 'soccer_uefa_champs_league', label: 'Champions League', af: 2 },
   { group: 'UEFA', key: 'soccer_uefa_europa_league', label: 'Europa League', af: 3 },
   { group: 'UEFA', key: 'soccer_uefa_europa_conference_league', label: 'Conference League', af: 848 },
@@ -522,11 +531,26 @@ function probabilitiesFor(comp, ev) {
   return { ok: false, reason: 'friendly — never picked' };
 }
 
-function groupCanPost(comp) {
+// Paper-first rule (29 Oct): with 14 leagues tested, one can pass by luck. A league
+// that passes its backtest must ALSO earn a forward paper record before it posts:
+// ≥ 28 days since it first passed, ≥ 20 settled paper picks, and those picks
+// beat the closing price on average (CLV > 0).
+const FORWARD = { minDays: 28, minPicks: 20, minCLV: 0 };
+async function forwardRecord(key) {
+  if (!DB) return null;
+  const since = await kvGet(`pass_since_${key}`);
+  const { data } = await DB.from('football_candidates').select('best_price, close_price, status').eq('competition', key).eq('selected', true).eq('status', 'settled');
+  const rows = data || [];
+  const clvs = rows.filter(r => r.close_price > 1).map(r => r.best_price / r.close_price - 1);
+  return { since, days: since ? (Date.now() - Date.parse(since)) / DAY : 0, picks: rows.length, clv: clvs.length ? clvs.reduce((a, b) => a + b, 0) / clvs.length : null };
+}
+async function groupCanPost(comp) {
   if (!CFG.posts) return false;
   if (comp.group !== 'DOMESTIC') return false; // UEFA / INTL / friendlies: paper until their forward record is reviewed
   const bt = STATE.backtest && STATE.backtest.leagues && STATE.backtest.leagues[comp.key];
-  return Boolean(bt && bt.pass);
+  if (!(bt && bt.pass)) return false;
+  const fr = await forwardRecord(comp.key);
+  return Boolean(fr && fr.days >= FORWARD.minDays && fr.picks >= FORWARD.minPicks && fr.clv !== null && fr.clv > FORWARD.minCLV);
 }
 
 async function dailyRun(day) {
@@ -536,6 +560,14 @@ async function dailyRun(day) {
   for (const comp of COMPS) {
     if (STATE.oddsRemaining !== null && STATE.oddsRemaining <= CFG.oddsReserve && comp.group !== 'DOMESTIC') { log(`odds budget low (${STATE.oddsRemaining}) — skipping ${comp.label}`); continue; }
     if (STATE.audit && STATE.audit.odds && STATE.audit.odds[comp.key] === 'NOT AVAILABLE') continue;
+    // V2.1: only spend odds credits where a pick is possible — domestic leagues that
+    // passed their backtest. UEFA / INTL borrow a near-zero model weight, so they can't
+    // produce model-based value; FOOTY_PAPER_ALL=on tracks them anyway.
+    if (process.env.FOOTY_PAPER_ALL !== 'on') {
+      if (comp.group !== 'DOMESTIC') continue;
+      const bt = STATE.backtest && STATE.backtest.leagues && STATE.backtest.leagues[comp.key];
+      if (!bt || !bt.pass) continue;
+    }
     const evs = await getJson(oddsUrl(`/sports/${comp.key}/events`, { dateFormat: 'iso' })); // free
     const upcoming = (Array.isArray(evs.body) ? evs.body : []).filter(e => { const t = Date.parse(e.commence_time); return t > now && t - now <= MODEL.decisionWindowH * 3600000; });
     if (!upcoming.length) continue;
@@ -562,7 +594,9 @@ async function dailyRun(day) {
   const qualifiers = all.filter(r => r.qualifies);
   const selected = rankAndCap(qualifiers);
   const selSet = new Set(selected);
-  const posting = selected.filter(r => groupCanPost(r.comp));
+  const postable = new Map();
+  for (const r of selected) if (!postable.has(r.comp.key)) postable.set(r.comp.key, await groupCanPost(r.comp));
+  const posting = selected.filter(r => postable.get(r.comp.key));
   log(`${day}: ${all.length} matches evaluated, ${qualifiers.length} qualified, ${selected.length} selected (${posting.length} postable) · odds credits left ${STATE.oddsRemaining}`);
   if (DB) {
     for (const r of all) {
@@ -579,7 +613,8 @@ async function dailyRun(day) {
     }
     await kvSet(`day_${day}`, { evaluated: all.length, qualified: qualifiers.length, selected: selected.length, posted: posting.length, oddsRemaining: STATE.oddsRemaining });
   }
-  if (CFG.posts) await post(picksMessage(day, posting, all.length));
+  if (CFG.posts && posting.length) await post(picksMessage(day, posting, all.length)); // no daily 'nothing today' posts
+  if (CFG.posts && posting.length && NOTIFY && require('./fun_money.js').ON) { try { await NOTIFY(funMessage(posting)); } catch (e) { log(`fun-money post failed: ${e.message}`); } }
   else if (selected.length) log(`(paper) ${picksMessage(day, selected, all.length)}`);
 }
 
@@ -599,6 +634,13 @@ function picksMessage(day, picks, evaluated) {
   return lines.join('\n');
 }
 
+let NOTIFY = null; // Hunter's alertUser: fun-money copy goes to the Hunter channel
+function funMessage(picks) {
+  const FUN = require('./fun_money.js');
+  const out = ['💰 FUN MONEY — FOOTBALL', ''];
+  for (const r of picks) out.push(`${r.ev.home_team} v ${r.ev.away_team} · ${ukTime(r.t)}`, `Back: ${sideName(r, r.best.side)} (90 mins) at ${r.best.quoted} or better (never below ${round(r.best.minPrice, 2)})`, FUN.betLine('football', Number(r.best.quoted)), '');
+  return out.join('\n').trim();
+}
 async function post(text) {
   if (!CFG.webhook) { log('DISCORD_WEBHOOK_FOOTY not set'); return false; }
   const safe = String(text).replace(/([\\*_~`|])/g, '\\$1');
@@ -693,6 +735,10 @@ async function refreshModels(force = false) {
     const last = await kvGet('backtest');
     const stale = !last || last.model !== MODEL.version || Date.now() - Date.parse(last.at) > 7 * DAY;
     if (stale) { STATE.backtest = await runBacktest(history); await kvSet('backtest', STATE.backtest); } else STATE.backtest = last;
+    // start each passing league's forward paper clock the first time it passes
+    for (const [key, l] of Object.entries(STATE.backtest.leagues || {})) {
+      if (l.pass && !(await kvGet(`pass_since_${key}`))) { await kvSet(`pass_since_${key}`, new Date().toISOString()); log(`${l.label} passed its backtest — starting a ${FORWARD.minDays}-day paper record before it can post`); }
+    }
     STATE.clubElo = await loadClubElo();
     STATE.intlElo = await loadIntlElo();
   }
@@ -719,6 +765,7 @@ async function tick() {
 
 function start(opts = {}) {
   DB = opts.db || null;
+  if (opts.notify) NOTIFY = opts.notify;
   if (!CFG.oddsKey) { log('ODDS_API_KEY not set — footy picks off'); return null; }
   log(`footy picks on · ${CFG.posts ? 'POSTING (backtest-passed leagues only)' : 'PAPER PHASE (audit + backtest + tracking, no posts)'} · picks after ${CFG.pickHourUK}:00 UK · 1X2, EV ≥ +${MODEL.minEV * 100}%, max ${MODEL.maxPerDay}/day`);
   setTimeout(tick, opts.startDelayMs ?? 150_000);
@@ -727,7 +774,7 @@ function start(opts = {}) {
 }
 
 module.exports = {
-  marketConsensus, blend, start, tick, MODEL, COMPS, STATE, fitPoisson, predictDomestic, scoreMatrixProbs, eloProbs, buildIntlElo, matchTeam, norm,
+  funMessage, _setNotify: n => { NOTIFY = n; }, marketConsensus, blend, start, tick, MODEL, COMPS, STATE, fitPoisson, predictDomestic, scoreMatrixProbs, eloProbs, buildIntlElo, matchTeam, norm,
   bestPrices, marketProbs, evaluate, rankAndCap, backtestLeague, summariseBets, applyDailyCap, parseCsv, fdDate, picksMessage,
   dailyRun, settle, weeklyReport, runBacktest, _setDb: d => { DB = d; }, _cfg: CFG,
 };

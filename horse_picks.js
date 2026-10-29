@@ -299,6 +299,14 @@ const ukDate = (d = new Date()) => new Intl.DateTimeFormat('en-CA', { timeZone: 
 const ukHour = (d = new Date()) => Number(new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', hour: '2-digit', hourCycle: 'h23' }).format(d));
 
 // ---------------------------------------------------------------- Discord
+let NOTIFY = null; // Hunter's alertUser: fun-money copy of the picks goes to the Hunter channel
+function funMessage(picks) {
+  const FUN = require('./fun_money.js');
+  const out = ['💰 FUN MONEY — HORSES', ''];
+  for (const p of picks) out.push(`${fmtOff(p.race)} ${F.course(p.race)} — ${p.pick.horse}${p.nap ? ' ⭐ NAP' : ''}`, FUN.betLine(p.nap ? 'horseNap' : 'horse'), '');
+  out.push('Take the best price you can find. Scores rank horses; they are not win chances.');
+  return out.join('\n');
+}
 async function post(text) {
   if (!CFG.posts) { log(`(paper phase — not posted)\n${text}`); return false; }
   if (!CFG.webhook) { log('DISCORD_WEBHOOK_HORSES not set — not posted'); return false; }
@@ -390,6 +398,7 @@ async function makePicks(day) {
     await kvSet(`day_${day}`, { stats, picks: picks.length, profile: picks[0]?.profile || audit.profile, posts: CFG.posts, version: MODEL.version });
   }
   await post(picksMessage(day, picks, stats));
+  if (CFG.posts && NOTIFY && picks.length && require('./fun_money.js').ON) { try { await NOTIFY(funMessage(picks)); } catch (e) { log(`fun-money post failed: ${e.message}`); } }
   return { picks, stats };
 }
 
@@ -504,6 +513,7 @@ async function tick() {
 
 function start(opts = {}) {
   DB = opts.db || null;
+  if (opts.notify) NOTIFY = opts.notify;
   if (!CFG.user || !CFG.pass) { log('RACING_API_USERNAME / RACING_API_PASSWORD not set — horse picks off'); return null; }
   log(`horse picks on · ${CFG.posts ? 'POSTING to Discord' : 'PAPER PHASE (audit + tracking, no posts)'} · picks after ${CFG.pickHourUK}:00 UK · model ${MODEL.version} (min ${MODEL.minScore}, lead ${MODEL.minGap}, max ${MODEL.maxPerDay}/day)`);
   setTimeout(tick, opts.startDelayMs ?? 120_000);
@@ -511,4 +521,4 @@ function start(opts = {}) {
   return { tick, STATE };
 }
 
-module.exports = { start, tick, MODEL, scoreRace, selectPicks, formPoints, ratingPoints, freshPoints, auditCards, auditResults, profileFrom, profileName, spToDecimal, picksMessage, makePicks, settle, collectResults, weeklyReport, _setDb: d => { DB = d; }, _cfg: CFG, STATE };
+module.exports = { start, tick, funMessage, _setNotify: n => { NOTIFY = n; }, MODEL, scoreRace, selectPicks, formPoints, ratingPoints, freshPoints, auditCards, auditResults, profileFrom, profileName, spToDecimal, picksMessage, makePicks, settle, collectResults, weeklyReport, _setDb: d => { DB = d; }, _cfg: CFG, STATE };
