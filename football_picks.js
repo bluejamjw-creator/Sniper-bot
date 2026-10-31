@@ -96,10 +96,12 @@ const CFG = {
   posts: /^(on|true|live)$/i.test(env('FOOTY_POSTS', 'off')),
   pickHourUK: Number(env('FOOTY_PICK_HOUR_UK', 11)),
   oddsReserve: Number(env('FOOTY_ODDS_RESERVE', 40)),
+  nap: env('FOOTY_NAP', 'on') !== 'off',
+  napCalls: Number(env('FOOTY_NAP_CALLS', 8)), // odds credits per day for the NAP search
 };
 
 let DB = null;
-const STATE = { oddsRemaining: null, oddsUsed: null, audit: null, backtest: null, intlElo: null, clubElo: null, domestic: new Map(), lastPickDay: '', ticking: false };
+const STATE = { oddsRemaining: null, oddsUsed: null, audit: null, backtest: null, intlElo: null, clubElo: null, domestic: new Map(), lastPickDay: '', lastNapDay: '', ticking: false };
 const log = m => console.log(`[FOOTY] ${m}`);
 const round = (v, d = 4) => (Number.isFinite(v) ? Math.round(v * 10 ** d) / 10 ** d : null);
 const DAY = 86400000;
@@ -663,7 +665,7 @@ async function captureClosing() {
     const odds = await getJson(oddsUrl(`/sports/${key}/odds`, { regions: 'uk', markets: 'h2h', oddsFormat: 'decimal', dateFormat: 'iso' }));
     const byId = new Map((Array.isArray(odds.body) ? odds.body : []).map(e => [e.id, e]));
     for (const r of due.filter(x => x.competition === key)) {
-      const ev = byId.get(r.id);
+      const ev = byId.get(String(r.id).replace(/^nap_/, ''));
       const p = ev ? bestPrices(ev)[r.best_side] : null;
       if (p) await DB.from('football_candidates').update({ close_price: p.price, close_at: new Date().toISOString() }).eq('id', r.id);
     }
@@ -680,7 +682,7 @@ async function settle() {
     const sc = await getJson(oddsUrl(`/sports/${key}/scores`, { daysFrom: 3, dateFormat: 'iso' })); // 2 credits
     const byId = new Map((Array.isArray(sc.body) ? sc.body : []).map(e => [e.id, e]));
     for (const r of due.filter(x => x.competition === key)) {
-      const e = byId.get(r.id);
+      const e = byId.get(String(r.id).replace(/^nap_/, ''));
       if (!e) { if (now - Date.parse(r.kickoff) > 4 * DAY) await DB.from('football_candidates').update({ status: 'unsettled' }).eq('id', r.id); continue; }
       if (!e.completed) continue;
       const g = Object.fromEntries((e.scores || []).map(s => [s.name, Number(s.score)]));
@@ -705,6 +707,7 @@ async function weeklyReport() {
     const clv = bets.filter(r => r.close_price).map(r => r.best_price / r.close_price - 1);
     lines.push(`${label}: ${bets.length} · ${bets.filter(r => r.won).length} won · ${pl >= 0 ? '+' : ''}${round(pl, 2)} units (ROI ${round((pl / bets.length) * 100, 1)}%)${clv.length ? ` · CLV ${round((clv.reduce((a, b) => a + b, 0) / clv.length) * 100, 1)}%` : ''}`);
   };
+  sum(rows.filter(r => r.grp === 'NAP'), 'Price picks');
   for (const g of ['DOMESTIC', 'UEFA', 'INTL']) {
     sum(rows.filter(r => r.grp === g && r.selected), `${g} picks`);
     sum(rows.filter(r => r.grp === g && r.qualifies), `${g} all +5% candidates`);
@@ -723,6 +726,92 @@ async function weeklyReport() {
   }
   lines.push(`Odds API credits left: ${STATE.oddsRemaining ?? '?'}`);
   return lines.join('\n');
+}
+
+
+// ---------------------------------------------------------------- NAP of the day (market-based)
+// The model can't beat the bookmakers (backtest), so the NAP doesn't pretend to. It takes the
+// bookmakers' own consensus chance (margin removed, averaged over every UK book) and looks for
+// the likeliest home/away winner where one book is offering MORE than that consensus implies.
+// That's price-shopping: the best available price against the market's own view.
+const NAP = { minEdge: 0.03, minP: 0.45, minPrice: 1.5, maxPrice: 2.6, minBooks: 4, minLeadMin: 60, windowH: 24 };
+const NAP_ORDER = ['soccer_epl', 'soccer_uefa_champs_league', 'soccer_uefa_europa_league', 'soccer_uefa_nations_league',
+  'soccer_fifa_world_cup_qualifiers_europe', 'soccer_uefa_euro_qualification', 'soccer_efl_champ', 'soccer_spain_la_liga',
+  'soccer_italy_serie_a', 'soccer_germany_bundesliga', 'soccer_france_ligue_one', 'soccer_uefa_europa_conference_league',
+  'soccer_spl', 'soccer_england_league1', 'soccer_netherlands_eredivisie', 'soccer_portugal_primeira_liga'];
+
+function napCandidates(comp, ev, now) {
+  const t = Date.parse(ev.commence_time);
+  if (!(t - now >= NAP.minLeadMin * 60000 && t - now <= NAP.windowH * 3600000)) return [];
+  const cons = marketConsensus(ev);
+  if (!cons || cons.books < NAP.minBooks) return [];
+  const prices = bestPrices(ev);
+  return ['home', 'away'].filter(side => prices[side]).map(side => {
+    const p = cons[side], d = prices[side].price, q = prices[side].quoted ?? d;
+    return { comp, ev, t, side, p, d, quoted: q, book: prices[side].book, edge: p * d - 1, cons, prices, minPrice: 1 / p };
+  }).filter(c => c.p >= NAP.minP && c.quoted >= NAP.minPrice && c.quoted <= NAP.maxPrice);
+}
+// Best price-vs-consensus first; among near-ties (within 1%), the likelier winner.
+function pickNap(cands) {
+  return [...cands].sort((a, b) => (Math.abs(b.edge - a.edge) > 0.01 ? b.edge - a.edge : b.p - a.p))[0] || null;
+}
+// Every candidate whose best price beats the market's own fair price by 3%+, best first (one per match).
+function pickAll(cands) {
+  const seen = new Set();
+  return [...cands].filter(c => c.edge >= NAP.minEdge).sort((a, b) => b.edge - a.edge).filter(c => !seen.has(c.ev.id) && seen.add(c.ev.id));
+}
+
+function napMessage(day, list) {
+  const out = [`⚽ FOOTY PICKS — ${day}`, ''];
+  list.forEach((n, i) => {
+    const team = n.side === 'home' ? n.ev.home_team : n.ev.away_team;
+    out.push(`${i === 0 ? '⭐ NAP · ' : '⚽ '}${team.toUpperCase()} TO WIN (90 mins)`,
+      `${n.ev.home_team} v ${n.ev.away_team} · ${ukTime(n.t)} · ${n.comp.label}`,
+      `Best price ${n.quoted} (${n.book}) · market chance ${round(n.p * 100, 0)}% · price ${round(n.edge * 100, 1)}% above fair`, '');
+  });
+  out.push('Picked on price, not a prediction model: likely winners where one bookie pays more than the market rates them. Bet responsibly.');
+  return out.join('\n');
+}
+function napFunMessage(n) {
+  const FUN = require('./fun_money.js');
+  const team = n.side === 'home' ? n.ev.home_team : n.ev.away_team;
+  return ['💰 FUN MONEY — FOOTY NAP', '', `⭐ ${team.toUpperCase()} to win · ${n.ev.home_team} v ${n.ev.away_team} · ${ukTime(n.t)}`,
+    FUN.betLine('footballNap', Number(n.quoted)), `Best price ${n.quoted} (${n.book}) — take the best price your bookie offers.`].join('\n');
+}
+
+async function napRun(day) {
+  const now = Date.now();
+  let calls = 0; const cands = [];
+  const comps = NAP_ORDER.map(k => COMPS.find(c => c.key === k)).filter(Boolean);
+  for (const comp of comps) {
+    if (calls >= CFG.napCalls) break;
+    if (STATE.oddsRemaining !== null && STATE.oddsRemaining <= CFG.oddsReserve) { log(`NAP: odds budget low (${STATE.oddsRemaining}) — stopping search`); break; }
+    if (STATE.audit && STATE.audit.odds && /NOT AVAILABLE|not active/.test(STATE.audit.odds[comp.key] || '')) continue;
+    const evs = await getJson(oddsUrl(`/sports/${comp.key}/events`, { dateFormat: 'iso' })); // free
+    const soon = (Array.isArray(evs.body) ? evs.body : []).filter(e => { const t = Date.parse(e.commence_time); return t - now >= NAP.minLeadMin * 60000 && t - now <= NAP.windowH * 3600000; });
+    if (!soon.length) continue;
+    const odds = await getJson(oddsUrl(`/sports/${comp.key}/odds`, { regions: 'uk', markets: 'h2h', oddsFormat: 'decimal', dateFormat: 'iso' })); // 1 credit
+    calls++;
+    for (const ev of Array.isArray(odds.body) ? odds.body : []) cands.push(...napCandidates(comp, ev, now));
+  }
+  const list = pickAll(cands);
+  const n = list[0] || null;
+  log(`NAP ${day}: ${cands.length} candidates, ${list.length} picks from ${calls} odds calls · ${n ? `${n.side === 'home' ? n.ev.home_team : n.ev.away_team} @ ${n.quoted} (cons ${round(n.p * 100, 1)}%, edge ${round(n.edge * 100, 1)}%)` : 'none'} · credits left ${STATE.oddsRemaining}`);
+  if (DB) {
+    for (const n of list) await DB.from('football_candidates').upsert({
+      id: `nap_${n.ev.id}`, decided_day: day, competition: n.comp.key, grp: 'NAP', home: n.ev.home_team, away: n.ev.away_team, kickoff: new Date(n.t).toISOString(),
+      model: 'market_nap', p_home: round(n.cons.home), p_draw: round(n.cons.draw), p_away: round(n.cons.away),
+      mkt_home: round(n.cons.home), mkt_draw: round(n.cons.draw), mkt_away: round(n.cons.away),
+      price_home: n.prices.home?.price ?? null, price_draw: n.prices.draw?.price ?? null, price_away: n.prices.away?.price ?? null,
+      best_side: n.side, best_price: n.d, best_book: n.book, ev: round(n.edge), min_price: round(n.minPrice, 3),
+      qualifies: true, selected: true, posted: Boolean(CFG.posts), reason: 'nap', odds_at: new Date().toISOString(), status: 'pending', model_version: `nap_v1`,
+    }, { onConflict: 'id' });
+    await kvSet(`nap_${day}`, { candidates: cands.length, calls, picks: list.map(x => `nap_${x.ev.id}`), oddsRemaining: STATE.oddsRemaining });
+  }
+  if (!n) return null;
+  if (CFG.posts) await post(napMessage(day, list)); else log(`(paper) ${napMessage(day, list)}`);
+  if (CFG.posts && NOTIFY && require('./fun_money.js').ON) { try { await NOTIFY(napFunMessage(n)); } catch (e) { log(`fun-money post failed: ${e.message}`); } }
+  return n;
 }
 
 // ---------------------------------------------------------------- scheduler
@@ -752,6 +841,7 @@ async function tick() {
     if (!STATE.audit || STATE.audit.at.slice(0, 10) !== new Date().toISOString().slice(0, 10)) await runAudit();
     await refreshModels();
     if (h >= CFG.pickHourUK && STATE.lastPickDay !== day && !(await kvGet(`day_${day}`))) { STATE.lastPickDay = day; await dailyRun(day); }
+    if (CFG.nap && h >= CFG.pickHourUK && STATE.lastNapDay !== day && !(await kvGet(`nap_${day}`))) { STATE.lastNapDay = day; await napRun(day); }
     await captureClosing();
     if ([9, 23].includes(h)) await settle();
     if (new Date().getUTCDay() === 1 && h === 9 && !(await kvGet(`report_${day}`))) {
@@ -767,14 +857,14 @@ function start(opts = {}) {
   DB = opts.db || null;
   if (opts.notify) NOTIFY = opts.notify;
   if (!CFG.oddsKey) { log('ODDS_API_KEY not set — footy picks off'); return null; }
-  log(`footy picks on · ${CFG.posts ? 'POSTING (backtest-passed leagues only)' : 'PAPER PHASE (audit + backtest + tracking, no posts)'} · picks after ${CFG.pickHourUK}:00 UK · 1X2, EV ≥ +${MODEL.minEV * 100}%, max ${MODEL.maxPerDay}/day`);
+  log(`footy picks on · ${CFG.posts ? 'POSTING (backtest-passed leagues only)' : 'PAPER PHASE (audit + backtest + tracking, no posts)'} · picks after ${CFG.pickHourUK}:00 UK · 1X2, EV ≥ +${MODEL.minEV * 100}%, max ${MODEL.maxPerDay}/day · NAP of the day ${CFG.nap ? `ON (up to ${CFG.napCalls} odds calls/day)` : 'off'}`);
   setTimeout(tick, opts.startDelayMs ?? 150_000);
   setInterval(tick, 10 * 60_000);
   return { tick, STATE };
 }
 
 module.exports = {
-  funMessage, _setNotify: n => { NOTIFY = n; }, marketConsensus, blend, start, tick, MODEL, COMPS, STATE, fitPoisson, predictDomestic, scoreMatrixProbs, eloProbs, buildIntlElo, matchTeam, norm,
+  napCandidates, pickNap, pickAll, napMessage, napFunMessage, napRun, NAP, funMessage, _setNotify: n => { NOTIFY = n; }, marketConsensus, blend, start, tick, MODEL, COMPS, STATE, fitPoisson, predictDomestic, scoreMatrixProbs, eloProbs, buildIntlElo, matchTeam, norm,
   bestPrices, marketProbs, evaluate, rankAndCap, backtestLeague, summariseBets, applyDailyCap, parseCsv, fdDate, picksMessage,
   dailyRun, settle, weeklyReport, runBacktest, _setDb: d => { DB = d; }, _cfg: CFG,
 };

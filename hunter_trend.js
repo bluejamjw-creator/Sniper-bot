@@ -72,7 +72,7 @@ const CONFIG = {
   snapshotEveryMs: 30 * 60_000,
   dailyRunUtcHour: Number(env('TREND_DAILY_HOUR_UTC', 9)),
   maxOpenPositions: Number(env('TREND_MAX_OPEN', 8)),
-  maxOpensPerRun: Number(env('TREND_MAX_OPENS_PER_RUN', 1)),
+  maxOpensPerRun: Number(env('TREND_MAX_OPENS_PER_RUN', 8)), // no per-day limit beyond open slots
   maxWatchPostsPerDay: Number(env('TREND_WATCH_MAX_POSTS_DAY', 12)),
   leaderboardRetentionDays: 21,
   concurrency: 3,

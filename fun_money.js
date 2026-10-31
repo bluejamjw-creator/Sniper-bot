@@ -6,12 +6,12 @@
  * slice of it per pick, sized so that if every lane is full at once the
  * pot is roughly used up and never exceeded by much:
  *   Hunter crypto 7% (up to 3 open) · SNIPER 8% (set in sniper.js)
- *   trend lane 4% · US stocks lane 3% · horse 1% (NAP 2%) · football 1%
- * FUN_MONEY=off removes the lines again.
+ *   trend lane 4% · US stocks lane 3% · horse NAP 2% · football NAP 2%
+ * Off by default. FUN_MONEY=on brings the stake lines back.
  */
 const POT = Number(process.env.FUN_POT) > 0 ? Number(process.env.FUN_POT) : 100;
-const ON = process.env.FUN_MONEY !== 'off';
-const PCT = { crypto: 0.07, sniper: 0.08, trend: 0.04, stocks: 0.03, horse: 0.01, horseNap: 0.02, football: 0.01 };
+const ON = process.env.FUN_MONEY === 'on'; // off by default: picks only, no stake lines
+const PCT = { crypto: 0.07, sniper: 0.08, trend: 0.04, stocks: 0.03, horse: 0.01, horseNap: 0.02, football: 0.01, footballNap: 0.02 };
 
 function stake(lane) { return Math.max(1, Math.round(POT * (PCT[lane] || 0.01))); }
 function gbp(x) {

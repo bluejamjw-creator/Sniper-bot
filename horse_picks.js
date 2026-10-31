@@ -56,7 +56,7 @@ const MODEL = Object.freeze({
   regions: ['GB', 'IRE'],
   minScore: 75,
   minGap: 8,
-  maxPerDay: 3,
+  maxPerDay: Infinity, // every qualifying race is posted
 });
 
 const CFG = {
@@ -300,11 +300,18 @@ const ukHour = (d = new Date()) => Number(new Intl.DateTimeFormat('en-GB', { tim
 
 // ---------------------------------------------------------------- Discord
 let NOTIFY = null; // Hunter's alertUser: fun-money copy of the picks goes to the Hunter channel
+function fieldSize(race) { return F.runners(race).filter(x => !F.nonRunner(x)).length; }
+// Each-way pays on 2 places with 5–7 runners, 3 places with 8+ (4 in big handicaps). Under 5 runners: win only.
 function funMessage(picks) {
   const FUN = require('./fun_money.js');
-  const out = ['💰 FUN MONEY — HORSES', ''];
-  for (const p of picks) out.push(`${fmtOff(p.race)} ${F.course(p.race)} — ${p.pick.horse}${p.nap ? ' ⭐ NAP' : ''}`, FUN.betLine(p.nap ? 'horseNap' : 'horse'), '');
-  out.push('Take the best price you can find. Scores rank horses; they are not win chances.');
+  const out = ['💰 FUN MONEY — HORSE NAP', ''];
+  for (const p of picks) {
+    const ew = fieldSize(p.race) >= 5;
+    const half = FUN.stake('horseNap') / 2;
+    out.push(`⭐ ${fmtOff(p.race)} ${F.course(p.race)} — ${p.pick.horse.toUpperCase()}`,
+      ew ? `💰 £${half} each-way (£${FUN.stake('horseNap')} total) — pays something if it finishes in the places` : FUN.betLine('horseNap'), '');
+  }
+  out.push('Take the best price you can find.');
   return out.join('\n');
 }
 async function post(text) {
@@ -324,6 +331,18 @@ async function post(text) {
 function fmtOff(race) {
   const t = Date.parse(F.off(race));
   return Number.isFinite(t) ? new Intl.DateTimeFormat('en-GB', { timeZone: 'Europe/London', hour: '2-digit', minute: '2-digit' }).format(t) : (race.off_time || '');
+}
+function napMessage(day, picks, stats) {
+  if (!picks.length) return [`🏇 HORSE PICKS — ${day}`, '', 'No picks today — no race met the model\'s thresholds.', `(${stats.eligible} of ${stats.races} races were eligible to score.)`].join('\n');
+  const out = [`🏇 HORSE PICKS — ${day}`, ''];
+  for (const p of picks) {
+    out.push(`${p.nap ? '⭐ NAP · ' : '🐎 '}${fmtOff(p.race)} ${F.course(p.race)} — ${p.pick.horse.toUpperCase()}${p.pick.number ? ` (${p.pick.number})` : ''}`,
+      `${F.name(p.race)} · ${fieldSize(p.race)} runners${/_hcap$/.test(p.profile) ? ' · handicap' : ''}`,
+      `Score ${p.pick.score.toFixed(1)}/100, ${p.gap.toFixed(1)} clear of ${p.runnerUp.horse}`,
+      ...p.pick.reasons.slice(0, 2).map(r => `· ${r}`), '');
+  }
+  out.push('Scores rank horses; they are not win chances. Bet responsibly.');
+  return out.join('\n');
 }
 function picksMessage(day, picks, stats) {
   if (!picks.length) return [`🏇 HORSE PICKS — ${day}`, '', 'No selections today: no race met the model\'s thresholds.', `(${stats.eligible} of ${stats.races} races were eligible to score.)`].join('\n');
@@ -397,8 +416,7 @@ async function makePicks(day) {
     }
     await kvSet(`day_${day}`, { stats, picks: picks.length, profile: picks[0]?.profile || audit.profile, posts: CFG.posts, version: MODEL.version });
   }
-  await post(picksMessage(day, picks, stats));
-  if (CFG.posts && NOTIFY && picks.length && require('./fun_money.js').ON) { try { await NOTIFY(funMessage(picks)); } catch (e) { log(`fun-money post failed: ${e.message}`); } }
+  await post(napMessage(day, picks, stats));
   return { picks, stats };
 }
 
@@ -521,4 +539,4 @@ function start(opts = {}) {
   return { tick, STATE };
 }
 
-module.exports = { start, tick, funMessage, _setNotify: n => { NOTIFY = n; }, MODEL, scoreRace, selectPicks, formPoints, ratingPoints, freshPoints, auditCards, auditResults, profileFrom, profileName, spToDecimal, picksMessage, makePicks, settle, collectResults, weeklyReport, _setDb: d => { DB = d; }, _cfg: CFG, STATE };
+module.exports = { start, tick, funMessage, napMessage, _setNotify: n => { NOTIFY = n; }, MODEL, scoreRace, selectPicks, formPoints, ratingPoints, freshPoints, auditCards, auditResults, profileFrom, profileName, spToDecimal, picksMessage, makePicks, settle, collectResults, weeklyReport, _setDb: d => { DB = d; }, _cfg: CFG, STATE };

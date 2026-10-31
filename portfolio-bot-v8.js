@@ -696,7 +696,7 @@ const CONFIG = {
   reopenCooldownMs: 90 * 60 * 1000,
   closeCooldownMs: 60 * 60 * 1000,
 
-  maxOpenPositions: 3,
+  maxOpenPositions: Number(process.env.HUNTER_MAX_OPEN || 10), // was 3: no practical daily limit on picks
   holdMinScoreImprovement: 0.05,
 
   openSimilarityThreshold: 0.70,
@@ -940,12 +940,12 @@ const CFG = {
   quoteRetentionDays: 5,
   signalWindowDays: 14,        // how long a signal is tracked
   cooldownDays: 5,             // per symbol
-  maxSignalsPerDay: 5,
+  maxSignalsPerDay: Infinity,  // no daily limit
   minDayChange: 3,             // % vs previous close
   maxDayChange: 12,            // above this the move has already happened
   minRangePos: 0.8,            // price in top 20% of the day's range
   targets: [10, 25, 50, 100],
-  maxOpen: 2,
+  maxOpen: 10,
   maxNewPerCycle: 1,
   maxQuoteAgeMs: 30 * 60 * 1000,   // a quote older than this is not 'now' (e.g. Friday's close on Monday)
   lockAtPct: process.env.HUNTER_STOP_LADDER ? 5 : Infinity, lockPct: 2, // V16.3: fixed stop unless the ladder is re-enabled
@@ -8443,7 +8443,7 @@ async function startup() {
     }
   }
 
-  try { const FUN = require('./fun_money.js'); console.log(`[FUN] fun money ${FUN.ON ? 'ON' : 'off'} · pot £${FUN.POT} · stakes crypto £${FUN.stake('crypto')} trend £${FUN.stake('trend')} stocks £${FUN.stake('stocks')} horse £${FUN.stake('horse')} (NAP £${FUN.stake('horseNap')}) football £${FUN.stake('football')}`); } catch (e) { console.error(`[FUN] ${e.message}`); }
+  try { const FUN = require('./fun_money.js'); console.log(`[FUN] fun money ${FUN.ON ? 'ON' : 'off'} · pot £${FUN.POT} · stakes crypto £${FUN.stake('crypto')} trend £${FUN.stake('trend')} stocks £${FUN.stake('stocks')} horse NAP £${FUN.stake('horseNap')} (each-way) football NAP £${FUN.stake('footballNap')}`); } catch (e) { console.error(`[FUN] ${e.message}`); }
   // V16.3: one-off 12-month replay of crypto entry rules (research only; results in replay_kv).
   try {
     require('./crypto_replay.js').start({ db: supabase, universe: () => (STATE.universe || []).map(a => a.symbol) });
